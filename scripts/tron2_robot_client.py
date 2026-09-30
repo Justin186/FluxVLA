@@ -406,6 +406,53 @@ def resolve_task(requested: str, tasks: dict) -> str:
                                                    key=lambda kv: kv[1]))))
 
 
+def initial_pose_for_task(subset: str):
+    """Mean first-frame arm pose across one subset's episodes.
+
+    Returns ``(arm14, spread, n)``: the 14 arm joints in servoj order
+    ``[L7, R7]``, the largest per-joint standard deviation across the episodes'
+    first frames (how reproducible that start pose actually is), and the number
+    of episodes averaged.
+
+    The recorded state is 16-dim ``[L7, gripL, R7, gripR]``, so the grippers at
+    index 7 and 15 are dropped.  The head is not recorded at all and is left
+    where it is.
+    """
+    import pyarrow.parquet as pq
+
+    files = sorted(glob.glob(os.path.join(
+        REPO, 'datasets/RealRobot_Tron2_lerobot', subset,
+        'data/chunk-*/file-*.parquet')))
+    if not files:
+        raise RuntimeError('no parquet under %s' % subset)
+    firsts = []
+    for path in files:
+        table = pq.read_table(path, columns=['observation.state'])
+        firsts.append(np.asarray(table['observation.state'].to_pylist(),
+                                 dtype=np.float64)[0])
+    stack = np.asarray(firsts)
+    mean = stack.mean(axis=0)
+    return np.concatenate([mean[0:7], mean[8:15]]), stack.std(axis=0).max(), \
+        len(files)
+
+
+def ease_to_pose(cur16: np.ndarray, target14: np.ndarray,
+                 seconds: float, hz: int) -> np.ndarray:
+    """Ease the 14 arm joints from ``cur16`` to ``target14`` over ``seconds``.
+
+    Raised-cosine in time, so the reference has zero velocity at both ends and
+    no step to jerk the controller.  Head entries of the 16-dim command are
+    held at the measured pose.
+    """
+    steps = max(int(seconds * hz), 2)
+    u = np.linspace(0.0, 1.0, steps)
+    gain = 0.5 - 0.5 * np.cos(np.pi * u)
+    traj = np.tile(np.asarray(cur16, dtype=np.float64), (steps, 1))
+    for i in range(14):
+        traj[:, i] = cur16[i] + (target14[i] - cur16[i]) * gain
+    return traj
+
+
 def gripper_command(act_grip01: float) -> float:
     """Model gripper action (0-1) -> the robot's 0-100 opening command."""
     return float(np.clip(act_grip01, 0.0, 1.0)) * GRIPPER_SCALE
@@ -474,14 +521,40 @@ def out_and_back(cur: np.ndarray, idx: int, amp: float,
     return traj
 
 
-def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int) -> float:
-    """Push a [T, 16] trajectory as a servoj stream; returns the wall time.
+def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int):
+    """Push a [T, 16] trajectory as a servoj stream.
 
-    Fire and forget on an absolute time axis, exactly like
+    Returns ``(elapsed_seconds, stats)`` where ``stats`` counts the robot's
+    replies and how many of them were not ``success``.
+
+    Sends fire-and-forget on an absolute time axis, exactly like
     ``Tron2Operator._servo_step`` at 500 Hz, so the cadence the robot sees here
     is the one it sees in deployment.
+
+    Replies are consumed by a background thread.  The robot answers every
+    servoj, and at 500 Hz an undrained receive buffer fills within a couple of
+    seconds -- after which the robot's own sends block and every later request
+    on that socket times out.  The deployed operator is saved from this only
+    because its WebSocketApp callback drains continuously.
     """
     steps = traj.shape[0]
+    state = {'stop': False, 'replies': 0, 'failed': 0}
+
+    def drainer():
+        ws.settimeout(0.3)
+        while not state['stop']:
+            try:
+                msg = json.loads(ws.recv())
+            except Exception:            # noqa: BLE001
+                continue
+            if str(msg.get('title', '')).startswith('response_'):
+                state['replies'] += 1
+                if msg.get('data', {}).get('result') != 'success':
+                    state['failed'] += 1
+
+    reader = threading.Thread(target=drainer, daemon=True)
+    reader.start()
+
     t0 = time.perf_counter()
     for i in range(steps):
         ws_send_raw(ws, accid, 'request_servoj', {
@@ -500,7 +573,11 @@ def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int) -> float:
             time.sleep(remaining - 1e-3)
         while time.perf_counter() < target:
             pass
-    return time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
+
+    state['stop'] = True
+    reader.join(timeout=1.0)
+    return elapsed, state
 
 
 def interpolate_plan(plan: np.ndarray, dt: float, hz: int) -> np.ndarray:
@@ -583,13 +660,15 @@ def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0) -> int:
         th = threading.Thread(target=sample, daemon=True)
         th.start()
         time.sleep(0.3)
-        stream_s = stream_trajectory(ws, accid, traj, hz)
+        stream_s, servo_stats = stream_trajectory(ws, accid, traj, hz)
         time.sleep(0.4)
         stop.set()
         th.join(timeout=5.0)
 
-        print('   流: %d 条 / %.3f s = 实测 %.0f Hz'
-              % (steps, stream_s, steps / stream_s))
+        print('   流: %d 条 / %.3f s = 实测 %.0f Hz；机器人回 %d 条，'
+              '非 success %d 条'
+              % (steps, stream_s, steps / max(stream_s, 1e-9),
+                 servo_stats['replies'], servo_stats['failed']))
         if samples['q']:
             q = np.array(samples['q'])
             ref = q[0, idx]
@@ -763,7 +842,12 @@ def main() -> int:
     ap.add_argument('--execute', action='store_true',
                     help='⚠️ 真的把计划下发给机器人（默认关闭：只预览不发送）')
     ap.add_argument('--yes', action='store_true',
-                    help='跳过 --execute 的交互式确认（供脚本调用）')
+                    help='跳过 --execute / --goto-initial 的交互式确认')
+    ap.add_argument('--goto-initial', action='store_true',
+                    help='⚠️ 平滑移动到 --task 对应数据集片段的起始位姿'
+                         '（需 --yes 或交互确认）')
+    ap.add_argument('--goto-seconds', type=float, default=10.0,
+                    help='--goto-initial 的运动时长(s)，默认 10')
     ap.add_argument('--selftest',
                     choices=['movej', 'servoj', 'servoj-stream', 'wiggle',
                              'gripper'],
@@ -789,6 +873,85 @@ def main() -> int:
             print('  %-42s  来自 %s' % (text, subset))
         return 0
     task = resolve_task(args.task, tasks)
+
+    if args.goto_initial:
+        import websocket
+
+        subset = next((k for k, v in tasks.items() if v == task), None)
+        if subset is None:
+            print('!! 找不到 %r 对应的数据集片段' % task)
+            return 2
+        target14, spread, n_eps = initial_pose_for_task(subset)
+        arm_names = ['abad_L', 'hip_L', 'yaw_L', 'knee_L', 'wy_L', 'wp_L',
+                     'wr_L', 'abad_R', 'hip_R', 'yaw_R', 'knee_R', 'wy_R',
+                     'wp_R', 'wr_R']
+
+        ws_goto = websocket.create_connection(args.ws, timeout=6.0)
+        try:
+            cur16 = np.asarray(
+                _request(ws_goto, args.accid, 'request_get_joint_state',
+                         6.0)['q'], dtype=np.float64)[:16]
+        finally:
+            ws_goto.close()
+
+        print('=' * 74)
+        print('  ⚠️  goto-initial: 将把双臂移动到数据集的起始位姿')
+        print('=' * 74)
+        print('  任务     : %r' % task)
+        print('  数据集   : %s  (%d 个片段的首帧均值)' % (subset, n_eps))
+        print('  首帧离散度: 最大单关节标准差 %.4f rad（越小越可复现）' % spread)
+        print('  运动时长 : %.1f s，raised-cosine（两端零速度）'
+              % args.goto_seconds)
+        print()
+        print('  %-8s %10s %10s %10s  %-16s %s'
+              % ('关节', '当前', '目标', 'Δ', '限位', '检查'))
+        n_bad = 0
+        for i, name in enumerate(arm_names):
+            lo, hi = JOINT_LIMITS[i]
+            ok = lo <= target14[i] <= hi
+            n_bad += 0 if ok else 1
+            print('  %-8s %10.4f %10.4f %+10.4f  [%6.2f,%6.2f]  %s'
+                  % (name, cur16[i], target14[i], target14[i] - cur16[i],
+                     lo, hi, 'OK' if ok else '!! 超限'))
+        biggest = float(np.abs(target14 - cur16[:14]).max())
+        print()
+        print('  最大单关节位移: %.4f rad (%.1f 度)'
+              % (biggest, np.degrees(biggest)))
+        if n_bad:
+            print('  !! %d 个关节的目标超出手册限位，拒绝执行。' % n_bad)
+            return 2
+        if not args.yes:
+            try:
+                answer = input('   确认请键入 yes 回车: ').strip().lower()
+            except EOFError:
+                answer = ''
+            if answer != 'yes':
+                print('   未确认，未发送任何指令。')
+                return 3
+
+        traj = ease_to_pose(cur16, target14, args.goto_seconds,
+                            SERVOJ_STREAM_HZ)
+        ws_goto = websocket.create_connection(args.ws, timeout=6.0)
+        try:
+            stream_s, servo_stats = stream_trajectory(ws_goto, args.accid,
+                                                      traj, SERVOJ_STREAM_HZ)
+            time.sleep(0.3)
+            after = np.asarray(
+                _request(ws_goto, args.accid, 'request_get_joint_state',
+                         6.0)['q'], dtype=np.float64)[:16]
+        finally:
+            ws_goto.close()
+        print()
+        print('  [执行] %d 条 @ %d Hz，流 %.3f s (实测 %.0f Hz)；机器人回 %d 条，'
+              '非 success %d 条'
+              % (traj.shape[0], SERVOJ_STREAM_HZ, stream_s,
+                 traj.shape[0] / max(stream_s, 1e-9),
+                 servo_stats['replies'], servo_stats['failed']))
+        print('  实测相对目标 max|Δ|: %.4f rad'
+              % float(np.abs(after[:14] - target14).max()))
+        print('  执行后 /joint_states(16): %s'
+              % np.array2string(after, precision=4))
+        return 0
 
     print('=' * 74)
     if args.execute:
@@ -923,12 +1086,13 @@ def main() -> int:
             print('  [执行] servoj %d 个 waypoint -> %d 条 @ %d Hz (%.2f s)'
                   % (plan.shape[0], ref.shape[0], SERVOJ_STREAM_HZ,
                      ref.shape[0] / SERVOJ_STREAM_HZ))
-            stream_s = stream_trajectory(ws_servo, args.accid, ref,
-                                         SERVOJ_STREAM_HZ)
+            stream_s, servo_stats = stream_trajectory(ws_servo, args.accid,
+                                                      ref, SERVOJ_STREAM_HZ)
             time.sleep(0.2)
             after = read_robot_state(args.ws, args.accid)[0]
-            print('     流 %.3f s (实测 %.0f Hz)'
-                  % (stream_s, ref.shape[0] / max(stream_s, 1e-9)))
+            print('     流 %.3f s (实测 %.0f Hz)；机器人回 %d 条，非 success %d 条'
+                  % (stream_s, ref.shape[0] / max(stream_s, 1e-9),
+                     servo_stats['replies'], servo_stats['failed']))
             print('     执行后 /joint_states(16): %s'
                   % np.array2string(after, precision=4))
             print('     实测相对计划末端 max|Δ|: %.4f rad'
