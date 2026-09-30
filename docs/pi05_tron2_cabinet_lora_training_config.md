@@ -996,6 +996,9 @@ def _should_save_step_checkpoint(self) -> bool:
 
 **加速比是 5.16x，不是文档宣称的 15x。** `docs/inference_acceleration.md` 的 15x 是在 **A100** 上标定的，**sm_89（4090）实测只有 5.16x**。
 
+> **现成的部署配置**：`configs/pi05/pi05_paligemma_tron2_cabinet_lora_deploy.py`
+> 用 `_base_` 复用训练配置，只覆盖 `inference_model`。已实测构建通过，可直接用于 `scripts/zmq_inference_server.sh`。
+
 #### 三个实测踩到的坑
 
 **① 非 RTC 版加速类在 3 路相机下会崩**
