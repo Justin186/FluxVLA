@@ -128,7 +128,8 @@ class ParquetDatasetV3(ParquetDataset):
                  window_start_idx: int = 1,
                  frame_window_size: int = 1,
                  frame_sample_stride: int = 1,
-                 expose_index: bool = False) -> None:
+                 expose_index: bool = False,
+                 supervise_terminal_padding: bool = False) -> None:
         """Initialize a parquet dataset backed by LeRobot v3 metadata.
 
         Args:
@@ -211,6 +212,7 @@ class ParquetDatasetV3(ParquetDataset):
         self.frame_window_size = frame_window_size
         self.frame_sample_stride = frame_sample_stride
         self.expose_index = expose_index
+        self.supervise_terminal_padding = supervise_terminal_padding
         for transform in transforms:
             self.transforms.append(build_transform_from_cfg(transform))
 
@@ -306,7 +308,8 @@ class ParquetDatasetV3(ParquetDataset):
             elif not future_in_range or future_task == 'empty':
                 for _ in range(self.action_window_size - len(actions)):
                     actions.append(actions[-1])
-                    action_masks.append(0)
+                    action_masks.append(
+                        1 if self.supervise_terminal_padding else 0)
                 break
             elif future_task == 'static':
                 window_idx += 1
