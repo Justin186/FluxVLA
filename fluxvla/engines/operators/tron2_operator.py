@@ -153,6 +153,15 @@ class Tron2Operator:
             12, 12, 15, 15, 10, 10, 10, 12, 12, 15, 15, 10, 10, 10, 3, 3
         ]
         self.servoj_frequency = 500  # Hz, minimum for stable control
+        # Mandatory on robot-tron2-r-2.1.24.  The official protocol (SDK guide
+        # 3.6.4.1) documents request_servoj as {"filter_ratio", "q"}, where 1.0
+        # means "trust the reference completely, no filtering".  Leave the field
+        # out and the robot still answers response_servoj {"result": "success"}
+        # and then ignores the command outright, so an entire trajectory runs
+        # with the arms never moving and every log line looking healthy.
+        # Measured on this robot: a +0.15 rad step produced 0.0000 rad of motion
+        # without the field and 0.1498 rad with it.
+        self.servoj_filter_ratio = 1.0
 
         # Tron2 joint names
         self.joint_names = [
@@ -456,6 +465,7 @@ class Tron2Operator:
         n = len(q_cmd)
         self._ws_send_request(
             'request_servoj', {
+                'filter_ratio': self.servoj_filter_ratio,
                 'q': list(q_cmd),
                 'v': [0.0] * n,
                 'kp': self.servoj_kp[:n],
