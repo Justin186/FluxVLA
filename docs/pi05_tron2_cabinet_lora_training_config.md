@@ -1099,35 +1099,80 @@ right_gripper_trajectory = actions[:, 17]
 
 **直接用 16 维输出会崩，即使不崩也是命令错位。**
 
-### 修法：部署侧加约 5 行重排
+### 已实现的修法：`DenormalizeTron2Action`
 
-放在 `Tron2InferenceRunner._postprocess_actions`（父类做完反归一化之后、夹爪夹紧判断之前）：
+**改动落在 `denormalize_action` 里，而不是 runner。** 因为本机直跑
+(`BaseInferenceRunner._postprocess_actions`) 和 ZMQ 服务 (`zmq_server.py:258`)
+**两条路径都会调用 `denormalize_action`** —— 放这里一处覆盖两条。
 
-```python
-# 16 -> 18: [L0..L6, gripL, R0..R6, gripR] -> [L0..L6, R0..R6, head2, gripL, gripR]
-def _expand_action_layout(self, a16, head_state=None):
-    T = a16.shape[0]
-    a18 = np.zeros((T, 18), dtype=a16.dtype)
-    a18[:, 0:7]   = a16[:, 0:7]        # 左臂
-    a18[:, 7:14]  = a16[:, 8:15]       # 右臂（平移）
-    a18[:, 14:16] = head_state if head_state is not None else 0.0  # 头部：不控制
-    a18[:, 16]    = a16[:, 7]          # 左夹爪
-    a18[:, 17]    = a16[:, 15]         # 右夹爪
-    return a18
-```
-
-> `enable_head_control` 默认 `False` → `head_trajectory=None` → 头部两槽填实际状态即"保持不动"。
-
-### 第二处：`state_permutation`
-
-`DenormalizeDeltaAction` 有个 `state_permutation` 参数，作用是让**机器人原始状态**的顺序与模型动作顺序对齐：
+新增 `fluxvla/transforms/normalize.py::DenormalizeTron2Action`（继承 `DenormalizeDeltaAction`）：
 
 ```python
-state_permutation = [0,1,2,3,4,5,6, 16, 7,8,9,10,11,12,13, 17]
-#                    └── 左臂 ──┘  └左夹爪┘ └──── 右臂 ────┘  └右夹爪┘
+expanded[..., ROBOT_ARM_L]  = action[..., POLICY_ARM_L]   # 左臂   0:7  -> 0:7
+expanded[..., ROBOT_ARM_R]  = action[..., POLICY_ARM_R]   # 右臂   8:15 -> 7:14
+expanded[..., ROBOT_GRIP_L] = action[..., POLICY_GRIP_L]  # 左夹爪 7    -> 16
+expanded[..., ROBOT_GRIP_R] = action[..., POLICY_GRIP_R]  # 右夹爪 15   -> 17
+expanded[..., ROBOT_HEAD]   = current_head(data)          # 头部保持当前位姿
 ```
 
-我们当前配置**没设这个** —— 不设的话，反归一化"加上当前状态"那一步会把状态加错维度。**部署前必须补。**
+配置侧改成：
+
+```python
+denormalize_action=dict(
+    type='DenormalizeTron2Action',     # ← 原来是 DenormalizeDeltaAction
+    norm_type='quantile',
+    action_dim=16,
+    delta_action_mask=[True]*7 + [False] + [True]*7 + [False],
+    state_permutation=[0,1,2,3,4,5,6, 16, 7,8,9,10,11,12,13, 17, 14,15],
+)
+```
+
+### `state_permutation` 的长度必须是 18，不是 16
+
+**这是实测推翻的一个关键点。** `DenormalizeDeltaAction` 的校验是：
+
+```python
+# normalize.py:476 —— 校验
+expected = np.arange(self.state_permutation.size, dtype=np.int64)
+if not np.array_equal(np.sort(self.state_permutation), expected):
+    raise ValueError('state_permutation must contain every index in [0, D) exactly once.')
+# normalize.py:496 —— 长度必须等于原始状态维度
+if state.shape[-1] != self.state_permutation.size:
+    raise ValueError('state_permutation length ... does not match raw state dimension ...')
+state = state[self.state_permutation]
+```
+
+**它只能重排、不能筛选。** 机器人原始状态是 18 维，所以 permutation 必须是 18 的全排列。写成 16 直接抛错：
+
+```
+ValueError: state_permutation must contain every index in [0, D) exactly once.
+```
+
+正确写法把模型要用的 16 位放**前 16 位**（`delta_action_mask` 只消费 `state[:16]`），头部两位放末尾（不参与）：
+
+```python
+state_permutation = [0,1,2,3,4,5,6, 16, 7,8,9,10,11,12,13, 17, 14,15]
+#                    └─ 左臂 ─┘ gripL └─── 右臂 ───┘ gripR  └头部┘
+```
+
+**不设或设错的后果（实测）**：dim8-14 会吃到机器人状态索引 8..14 = 右臂[1..6] + `head_pitch`，**右臂整体错位一格并混入头部值**。
+
+### 左夹爪是个退化维度
+
+实测统计量：
+
+```
+dim  7 (左夹爪): q01=0.0000  q99=0.0000  min=0  max=0  std=0    ← 全数据集恒为 0
+dim 15 (右夹爪): q01=0.0000  q99=1.0000  mean=0.2142           ← 正常
+```
+
+**左夹爪在采集期间从未动过**，量化区间退化 → 反归一化把任何输入都塌成 0。所以左夹爪既学不到东西、输出也恒为 0。**部署时若需要左夹爪动作必须另行处理，不要指望模型。**
+
+### 测试
+
+`test/test_transforms/test_tron2_action_layout.py`（11 个用例）覆盖：16→18 映射、状态重排落位、
+头部保持、夹爪不串位、**长度 16 的 permutation 必须报错**（防止回退到错误写法）、
+已展开动作透传、以及从实际配置构建并验证映射。
 
 ### 部署前的风险清单
 

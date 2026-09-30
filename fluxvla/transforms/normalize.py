@@ -510,6 +510,117 @@ class DenormalizeDeltaAction(DenormalizePrivateAction):
 
 
 @TRANSFORMS.register_module()
+class DenormalizeTron2Action(DenormalizeDeltaAction):
+    """Denormalize delta actions and expand them to the TRON2 18-dim layout.
+
+    Policies trained on the TRON2 cabinet dataset emit ``action_dim`` values
+    ordered as::
+
+        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+
+    while ``Tron2InferenceRunner`` and the robot expect::
+
+        [left_arm(7), right_arm(7), head(2), left_gripper(1), right_gripper(1)]
+
+    Passing the policy output through unexpanded would make the runner read
+    the right arm from the wrong slots (shifted by one joint, so a head value
+    leaks into the last right-arm joint) and raise ``IndexError`` on the
+    gripper columns, which the runner addresses at indices 16 and 17.
+
+    Doing the expansion inside the denormalization transform covers both the
+    local runner path (``BaseInferenceRunner._postprocess_actions``) and the
+    ZMQ server path, since both invoke ``denormalize_action``.
+
+    The two head slots repeat the current head position so the head holds
+    still.  They are ignored entirely while ``enable_head_control`` is False.
+
+    Note:
+        The raw robot state keeps its native 18-dim layout, so
+        ``state_permutation`` must be a permutation of ``range(18)`` even
+        though the policy action is 16-dim.  ``DenormalizeDeltaAction``
+        reorders without dropping dimensions, which is enough here because
+        the head slots it appends after the first 16 entries are never
+        consumed by the delta mask.
+    """
+
+    ROBOT_ACTION_DIM = 18
+    # 16-dim policy action slots.
+    POLICY_ARM_L = slice(0, 7)
+    POLICY_GRIP_L = 7
+    POLICY_ARM_R = slice(8, 15)
+    POLICY_GRIP_R = 15
+    # 18-dim robot command slots.
+    ROBOT_ARM_L = slice(0, 7)
+    ROBOT_ARM_R = slice(7, 14)
+    ROBOT_HEAD = slice(14, 16)
+    ROBOT_GRIP_L = 16
+    ROBOT_GRIP_R = 17
+    DEFAULT_HEAD = 0.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.action_dim is None:
+            raise ValueError(
+                'DenormalizeTron2Action requires action_dim to describe the '
+                'policy action width.')
+        if self.action_dim >= self.ROBOT_ACTION_DIM:
+            raise ValueError(
+                f'action_dim must be smaller than {self.ROBOT_ACTION_DIM}, '
+                f'got {self.action_dim}.')
+
+    def __call__(self, data: Dict) -> np.ndarray:
+        # Validate the incoming width first: the parent broadcasts the delta
+        # mask over the action, so a mismatched width would otherwise surface
+        # as an opaque numpy broadcasting error.
+        incoming = getattr(data.get('action'), 'shape', None)
+        if incoming is not None and incoming[-1] not in (
+                self.action_dim, self.ROBOT_ACTION_DIM):
+            raise ValueError(
+                f'Expected a {self.action_dim}-dim policy action or an '
+                f'already expanded {self.ROBOT_ACTION_DIM}-dim action, got '
+                f'{incoming[-1]}.')
+
+        action = np.asarray(super().__call__(data), dtype=np.float32)
+        width = action.shape[-1]
+        if width == self.ROBOT_ACTION_DIM:
+            return action
+        if width != self.action_dim:
+            raise ValueError(
+                f'Denormalization changed the action width to {width}; '
+                f'expected {self.action_dim}.')
+
+        expanded = np.zeros(
+            action.shape[:-1] + (self.ROBOT_ACTION_DIM, ), dtype=action.dtype)
+        expanded[..., self.ROBOT_ARM_L] = action[..., self.POLICY_ARM_L]
+        expanded[..., self.ROBOT_ARM_R] = action[..., self.POLICY_ARM_R]
+        expanded[..., self.ROBOT_GRIP_L] = action[..., self.POLICY_GRIP_L]
+        expanded[..., self.ROBOT_GRIP_R] = action[..., self.POLICY_GRIP_R]
+        expanded[..., self.ROBOT_HEAD] = self.current_head(data)
+        return expanded
+
+    def current_head(self, data: Dict) -> np.ndarray:
+        """Return the current head position, or the default when unavailable.
+
+        ``data['state']`` holds the raw robot state in its native 18-dim
+        layout, which ``DenormalizeDeltaAction`` reorders only into a local
+        variable.  The head therefore still sits at indices 14-15.
+        """
+        zeros = np.full(
+            self.ROBOT_HEAD.stop - self.ROBOT_HEAD.start,
+            self.DEFAULT_HEAD,
+            dtype=np.float32)
+        state = data.get('state')
+        if state is None:
+            return zeros
+        state = np.asarray(state, dtype=np.float32)
+        if state.ndim == 2 and state.shape[0] == 1:
+            state = state[0]
+        if state.ndim != 1 or state.shape[0] < self.ROBOT_ACTION_DIM:
+            return zeros
+        return state[self.ROBOT_HEAD]
+
+
+@TRANSFORMS.register_module()
 class NormalizeStatesAndActions:
     """Normalize states and actions in the data.
     This transform normalizes the state and action

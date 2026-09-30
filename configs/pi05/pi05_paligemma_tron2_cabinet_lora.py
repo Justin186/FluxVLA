@@ -342,11 +342,22 @@ inference = dict(
                 backend='pil'),
             dict(type='SimpleNormalizeImages'),
         ]),
+    # 模型输出 16 维 [L7,gripL,R7,gripR]，而 Tron2InferenceRunner
+    # 和机器人需要 18 维 [L7,R7,head2,gripL,gripR]。展开放在这里，
+    # 本机直跑 (BaseInferenceRunner._postprocess_actions) 与 ZMQ
+    # 服务两条路径都会经过 denormalize_action，一处覆盖两条。
     denormalize_action=dict(
-        type='DenormalizeDeltaAction',
+        type='DenormalizeTron2Action',
         norm_type='quantile',
         action_dim=16,
         delta_action_mask=[True] * 7 + [False] + [True] * 7 + [False],
+        # 机器人原始状态 18 维 [L7,R7,head2,gripL,gripR]，要重排成
+        # 模型动作顺序 [L7,gripL,R7,gripR,head2]。前 16 位被
+        # delta_action_mask 使用，末尾两位（头部）不参与。
+        # state_permutation 只能重排不能筛选，所以长度必须是 18；
+        # 写成 16 会触发 "must contain every index in [0, D)"。
+        state_permutation=[0, 1, 2, 3, 4, 5, 6, 16, 7, 8, 9, 10, 11, 12,
+                           13, 17, 14, 15],
     ),
     action_chunk=32,
     operator=dict(
