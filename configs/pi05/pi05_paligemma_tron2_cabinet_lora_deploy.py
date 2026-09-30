@@ -37,7 +37,10 @@ _base_ = './pi05_paligemma_tron2_cabinet_lora.py'
 inference_model = dict(
     type='PI05FlowMatchingRTCInference',
     num_view=3,
-    triton_max_prompt_len=48,
+    # Must cover the real prompt length: ``PreparePromptWithState`` writes all
+    # 32 (padded) normalized state values into the prompt, which tokenizes to
+    # ~135-142 tokens, and ``ProcessPrompts`` caps the prompt at 200.
+    triton_max_prompt_len=200,
     num_steps=10,
     llm_backbone=dict(
         type='ConditionGemmaInferenceModel',
@@ -156,5 +159,35 @@ inference_model = dict(
         }
     ),
     params_to_change_dtype=['llm_expert.llm.model.layers', 'vlm_backbone.vlm.model.language_model.layers', 'vlm_backbone.vlm.model.vision_tower', 'vlm_backbone.vlm.model.multi_modal_projector'],
-    ori_action_dim=14,
+    # Real (unpadded) action width.  Must match the training config, otherwise
+    # the 32-dim padded prediction cannot be denormalized back to 16 dims.
+    ori_action_dim=16,
 )
+
+# ZMQ serving wiring for ``scripts/zmq_inference_server.sh``.
+# ``FluxVLAZMQEvalServer`` requires a ``themis`` section; without it the server
+# aborts with ``KeyError: config.themis is required``.
+#
+# Observation contract of ``predict_action`` (batch size 1):
+#   * ``qpos``   -- 16-dim state in *policy* order [L7, gripL, R7, gripR].
+#                   It is the only field the dataset normalizes, and the
+#                   quantile statistics are 16-dim, so it must stay 16-dim.
+#   * ``states`` -- 18-dim raw robot state [L7, R7, head(2), gripL, gripR].
+#                   DenormalizeDeltaAction uses it as the delta base and
+#                   DenormalizeTron2Action reads head from indices 14-15.
+#   * ``cam_high`` / ``cam_left_wrist`` / ``cam_right_wrist`` -- HxWx3 uint8.
+#   * ``task_description`` -- task string, e.g. 'Press the red button'.
+themis = dict(
+    transport=dict(
+        service_name='/fluxvla/predict_action',
+        image_keys=['cam_high', 'cam_left_wrist', 'cam_right_wrist'],
+        state_keys=['qpos', 'states'],
+        unnorm_key='private',
+        image_encoding='rgb8',
+    ),
+    ros_server=dict(
+        dataset_section='inference',
+        device='cuda:0',
+    ),
+)
+

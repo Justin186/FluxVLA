@@ -329,6 +329,12 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
         self.num_views = num_views
         self.triton_max_prompt_len = triton_max_prompt_len
         self.num_steps = num_steps
+        # The Triton path bypasses the action head, which is where the eager
+        # pipelines apply ``ori_action_dim``.  Without this the prediction keeps
+        # ``max_action_dim`` (padded) columns and the denormalization transform
+        # rejects it.  Read it without consuming it so the head still receives
+        # the same value through ``kwargs``.
+        self.ori_action_dim = kwargs.get('ori_action_dim')
         self._triton_ready = False
         self._cuda_graph = None
         self._cuda_graph_ready = False
@@ -698,6 +704,8 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
             prev_actions=prev_actions,
             prefix_len=prefix_len if rtc_method == 'prefix' else 0)
         result = denoised[:, :self.max_action_dim].unsqueeze(0).float()
+        if self.ori_action_dim is not None:
+            result = result[..., :self.ori_action_dim]
 
         return result
 
