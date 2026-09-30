@@ -634,6 +634,20 @@ class PI05FlowMatchingRTCInference(PI05FlowMatching):
 
         if not self._cuda_graph_ready:
             self._build_cuda_graph()
+            # ``_build_cuda_graph`` runs three warm-up passes and the capture
+            # pass over the in-place denoising buffer, so afterwards the buffer
+            # holds the result of four chained denoising passes instead of the
+            # caller's noise.  Replaying here would denoise it a fifth time and
+            # the first prediction after startup would differ from every later
+            # one (measured: right-arm deviation 0.41 rad vs 0.03 rad).  Re-enter
+            # to re-stage the caller's original inputs before the first replay.
+            return self._triton_forward(
+                images_nhwc,
+                prompt_embeds,
+                prompt_len,
+                diffusion_noise,
+                prev_actions=prev_actions,
+                prefix_len=prefix_len)
 
         self._cuda_graph.replay()
         return self._triton_bufs['diffusion_noise']
