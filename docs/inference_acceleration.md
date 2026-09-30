@@ -1,6 +1,11 @@
 # Inference Acceleration
 
-FluxVLA provides inference-optimized model variants for GR00T and PI0.5, achieving significant speedups on A100 hardware (GR00T ~5x, PI0.5 ~15x) through a combination of custom Triton kernels, CUDA Graphs, and algorithmic optimizations.
+FluxVLA provides inference-optimized model variants for GR00T and PI0.5, achieving significant speedups on A100 hardware (GR00T ~5x, PI0.5 ~10x) through a combination of custom Triton kernels, CUDA Graphs, and algorithmic optimizations.
+
+> **The speedup is hardware- and workload-dependent — do not quote one number across devices.**
+> The per-device tables at the end of this document span 2.3x (AGX Orin, GR00T) to 9.6x
+> (A100, PI0.5). On sm_89 (RTX 4090) the PI0.5 RTC path measures **5.16x** for the TRON2
+> 3-camera cabinet policy — see the RTX 4090 section below.
 
 ## Overview
 
@@ -311,6 +316,24 @@ Notes:
 | Model     | Baseline (Hz) | Accelerated (Hz) | Speedup |
 | --------- | ------------- | ---------------- | ------- |
 | PI0.5-rtc | 3.4           | 19.6             | 6.66x   |
+
+### On RTX 4090 D Device (Latency, TRON2 3-camera cabinet policy)
+
+Measured on a 4090 D (sm_89), 3 camera views, after warmup, median of 20 runs under
+`torch.autocast('cuda', dtype=torch.bfloat16)`:
+
+| Path | Latency | Speedup |
+| ---- | ------- | ------- |
+| `PI05FlowMatching` (plain) | 236.3 ms | 1x |
+| `PI05FlowMatchingRTCInference` | 45.8 ms | **5.16x** |
+
+Two caveats when comparing against the frequency tables above:
+
+- The first call costs an extra ~6–30 s for Triton JIT compilation plus CUDA-Graph capture.
+  **Always warm the service up once before commanding the robot.**
+- Latency depends on the prompt length. `triton_max_prompt_len` must cover the real prompt
+  (the TRON2 cabinet prompt tokenizes to ~135–142 tokens because `PreparePromptWithState`
+  writes all 32 padded state values into the text), and a larger buffer costs slightly more.
 
 ### On AGX Orin 64GB Device (Inference Frequency)
 
