@@ -112,7 +112,14 @@ DEFAULT_HEAD_MAX_DELTA = 0.05     # rad; the head is cosmetic and slow
 # Envelope: how far one chunk may end up from the pose it started at.  This is
 # the naming-independent protection -- it caps how much can go wrong if a joint
 # is mislabelled, without constraining the shape of a legitimate trajectory.
-DEFAULT_MAX_REACH = 1.00          # rad, ~57 deg per chunk
+#
+# It has to clear the policy's own output, otherwise the rail stops being a rail
+# and becomes part of the controller.  Measured on the TRON2 cabinet policy: it
+# asks for 0.83-0.92 rad within a chunk, so the earlier 0.80 default clipped
+# every reach and the arm fell short of the button.  The old recordings are also
+# a sanity check on the scale -- their whole press moves at most 0.75 rad.  Set
+# this well above the observed spread, not at its edge.
+DEFAULT_MAX_REACH = 1.20          # rad, ~69 deg per chunk
 DEFAULT_HEAD_MAX_REACH = 0.20     # rad
 
 
