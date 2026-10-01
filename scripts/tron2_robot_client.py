@@ -101,6 +101,11 @@ JOINT_LIMITS = np.array([
     [-1.57, 1.57],    # 15 head yaw
 ], dtype=np.float64)
 
+# Same order, so a deviation measured in a joint trace can be named directly.
+JOINT_NAMES = ['abad_L', 'hip_L', 'yaw_L', 'knee_L', 'wy_L', 'wp_L', 'wr_L',
+               'abad_R', 'hip_R', 'yaw_R', 'knee_R', 'wy_R', 'wp_R', 'wr_R',
+               'head_pitch', 'head_yaw']
+
 # Rate limit: the largest jump allowed *between two consecutive servo
 # commands*, the first command being measured against the pose the robot
 # reports right now.  Bounding the increment rather than the offset from the
@@ -235,6 +240,20 @@ def ws_drain(ws, seconds: float):
         except Exception:                # noqa: BLE001
             break
     return out
+
+
+def send_gripper(ws, accid: str, right01: float):
+    """Command the right gripper.  Model output is 0-1, the robot wants 0-100.
+
+    Speed and force follow ``Tron2Operator._send_gripper``.  The left gripper is
+    never commanded: it is constant 0 across all five training subsets, so the
+    policy has no signal for it and the recordings never move it.
+    """
+    ws_send_raw(ws, accid, 'request_set_limx_2fclaw_cmd', {
+        'right_opening': float(np.clip(right01, 0.0, 1.0) * GRIPPER_SCALE),
+        'right_speed': 100,
+        'right_force': 100,
+    })
 
 
 # --------------------------------------------------------------------------- #
@@ -460,6 +479,135 @@ def ease_to_pose(cur16: np.ndarray, target14: np.ndarray,
     return traj
 
 
+# Cap on how fast the fastest joint may travel during a goto.  The training
+# start pose is far from wherever a restart leaves the robot -- on this machine
+# yaw_R alone has 1.76 rad (101 deg) to travel -- so the duration is derived
+# from the distance rather than fixed, and the operator gets a number that
+# means something when deciding whether the path is clear.
+DEFAULT_GOTO_VEL = 0.15           # rad/s, roughly 8.6 deg/s
+
+
+def goto_seconds_for(target14: np.ndarray, cur16: np.ndarray,
+                     max_vel, fallback: float) -> float:
+    """Duration for ``ease_to_pose`` so the peak joint velocity is ``max_vel``.
+
+    The raised-cosine gain's peak slope is ``span * pi / (2 * T)``, so
+    ``T = span * pi / (2 * max_vel)`` holds the fastest joint at the cap.
+    A ``max_vel`` of 0 or None keeps ``fallback`` seconds instead.
+    """
+    if max_vel is None or max_vel <= 0:
+        return float(fallback)
+    span = float(np.abs(np.asarray(target14)
+                        - np.asarray(cur16)[:len(target14)]).max())
+    return max(span * np.pi / (2.0 * float(max_vel)), 0.5)
+
+
+# Order in which the arm joints travel to the training start pose, in servoj
+# order.  Interpolating all 14 at once turns the shoulder yaw and bends the
+# elbow in the same breath, so the forearm sweeps a wide arc and on this robot
+# puts it into the table in front.  Doing it in groups keeps the hands clear:
+# orient the wrists first, then bring the shoulders and elbows round, and only
+# then swing the shoulder yaw through its 85 degrees.
+GOTO_STAGES = [
+    # Elbow first, upper arm still.  Measured on the robot: folding from the
+    # home pose sends the forearm *outward*, clear of the table and of the
+    # legs, and it is the shoulder yaw roll that decides which way the fold
+    # goes.  A 180 degree pre-roll flipped it inward and drove the forearm into
+    # the operator's legs, so the roll is deliberately left out and yaw is
+    # turned last instead.  Add "2=~-3.1416,9=~3.1416" as a first stage only
+    # if you want that flip back.
+    ('小臂往外举 90 度', [(3, None), (10, None)]),        # elbow
+    ('手臂离开双腿、前后到位', [(1, None), (8, None), (0, None), (7, None)]),
+    ('手腕到位',       [(4, None), (5, None), (6, None),
+                        (11, None), (12, None), (13, None)]),
+    ('大臂转回 90 度', [(2, None), (9, None)]),           # shoulder yaw, last
+]
+
+
+def parse_stage_spec(spec: str):
+    """Parse a stage spec into ``[(label, [(joint, value_or_None), ...]), ...]``.
+
+    Stages are separated by ``;`` and joints within a stage by ``,``.  A token
+    is either a joint index (move it to its final target now) or
+    ``index=value`` (move it to that value now -- a temporary dodge -- and let
+    a later stage bring it to the target).  Example::
+
+        0=-1.2,7=-1.2; 3,10; 2,9; 0,7
+    """
+    out = []
+    for n, chunk in enumerate(str(spec).split(';')):
+        items = []
+        for token in chunk.replace(' ', '').split(','):
+            if not token:
+                continue
+            if '=' in token:
+                key, val = token.split('=', 1)
+                if val.startswith('~'):
+                    # "~offset" is measured from where the joint is right now,
+                    # so a dodge written as "spin 180 degrees" stays a true 180
+                    # whatever pose the move happens to start from.
+                    items.append((int(key), ('rel', float(val[1:]))))
+                else:
+                    items.append((int(key), float(val)))
+            else:
+                items.append((int(token), None))
+        if items:
+            out.append(('阶段%d' % (n + 1), items))
+    return out
+
+
+def stage_goto(cur16: np.ndarray, target14: np.ndarray, stages, max_vel: float,
+               hz: int, frac: float = 1.0):
+    """One continuous reference that moves the arm joints a stage at a time.
+
+    Each stage eases only its own joints toward the target and holds the rest,
+    so the operator can order the motion to clear whatever is in the way.  The
+    stages are concatenated into a *single* stream: pausing between them would
+    drop servo control and re-engage it, which is exactly the hand-over that
+    bangs when the brakes let go.
+
+    Returns ``(traj, plan)`` where ``plan`` is ``[(label, indices, seconds)]``
+    for reporting.
+    """
+    target14 = np.asarray(target14, dtype=np.float64)
+    cur = np.asarray(cur16, dtype=np.float64)[:16].copy()
+    rows = []
+    plan = []
+    for label, items in stages:
+        pairs = []
+        for i, v in items:
+            if not (0 <= i < 14):
+                continue
+            if v is None:
+                dst = float(target14[i])
+            elif isinstance(v, tuple):        # ('rel', offset)
+                dst = float(cur[i]) + v[1]
+            else:
+                dst = float(v)
+            # frac < 1 walks only part of the way -- enough to see which way a
+            # joint is heading before committing to the whole move.
+            pairs.append((i, float(cur[i]) + frac * (dst - float(cur[i]))))
+        if not pairs:
+            continue
+        span = max(abs(v - cur[i]) for i, v in pairs)
+        if span < 1e-9:
+            plan.append((label, pairs, 0.0))
+            continue
+        seconds = max(span * np.pi / (2.0 * max_vel), 0.5)
+        steps = max(int(round(seconds * hz)), 2)
+        gain = 0.5 - 0.5 * np.cos(np.pi * np.linspace(0.0, 1.0, steps))
+        block = np.tile(cur, (steps, 1))
+        for i, v in pairs:
+            block[:, i] = cur[i] + (v - cur[i]) * gain
+        rows.append(block)
+        for i, v in pairs:
+            cur[i] = v
+        plan.append((label, pairs, seconds))
+    if not rows:
+        return np.asarray(cur, dtype=np.float64)[None, :], plan
+    return np.vstack(rows), plan
+
+
 def gripper_command(act_grip01: float) -> float:
     """Model gripper action (0-1) -> the robot's 0-100 opening command."""
     return float(np.clip(act_grip01, 0.0, 1.0)) * GRIPPER_SCALE
@@ -528,11 +676,18 @@ def out_and_back(cur: np.ndarray, idx: int, amp: float,
     return traj
 
 
-def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int):
+def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int,
+                      gripper=None, sub_steps=None):
     """Push a [T, 16] trajectory as a servoj stream.
 
     Returns ``(elapsed_seconds, stats)`` where ``stats`` counts the robot's
     replies and how many of them were not ``success``.
+
+    ``gripper`` is an optional per-waypoint right-gripper trajectory (0-1) and
+    ``sub_steps`` is how many servo messages each waypoint is expanded into.
+    When both are given the gripper is commanded once per waypoint, which is
+    what ``Tron2Operator._run_trajectory_servoj`` does -- the selector tasks
+    need it, the button tasks leave the gripper at 0 throughout.
 
     Sends fire-and-forget on an absolute time axis, exactly like
     ``Tron2Operator._servo_step`` at 500 Hz, so the cadence the robot sees here
@@ -545,7 +700,7 @@ def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int):
     because its WebSocketApp callback drains continuously.
     """
     steps = traj.shape[0]
-    state = {'stop': False, 'replies': 0, 'failed': 0}
+    state = {'stop': False, 'replies': 0, 'failed': 0, 'faults': []}
 
     def drainer():
         ws.settimeout(0.3)
@@ -554,16 +709,40 @@ def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int):
                 msg = json.loads(ws.recv())
             except Exception:            # noqa: BLE001
                 continue
-            if str(msg.get('title', '')).startswith('response_'):
+            title = str(msg.get('title', ''))
+            data = msg.get('data') or {}
+            if title.startswith('response_'):
                 state['replies'] += 1
-                if msg.get('data', {}).get('result') != 'success':
+                res = data.get('result')
+                if res != 'success':
                     state['failed'] += 1
+                    # Keep the reasons, not just the count: a rejected command
+                    # is the robot refusing to move, and on this machine it
+                    # means the motor faulted (measured: fail_motor during a
+                    # DC link under-voltage while moving fast under load).
+                    if len(state['faults']) < 6:
+                        state['faults'].append('%s (response #%d)'
+                                               % (res, state['replies']))
+            elif title == 'notify_servoJ':
+                # SDK guide 3.6.4.3: servoj has no reply, so this push is the
+                # only signal that a command was rejected -- fail_motor means
+                # the motor itself faulted.  Missing it would let a whole
+                # trajectory run while the arm refuses to move and nothing
+                # anywhere says so.
+                state['faults'].append(str(data.get('result')))
 
     reader = threading.Thread(target=drainer, daemon=True)
     reader.start()
 
     t0 = time.perf_counter()
+    last_seg = -1
     for i in range(steps):
+        if gripper is not None and sub_steps:
+            seg = i // sub_steps
+            if seg != last_seg:
+                send_gripper(ws, accid,
+                             float(gripper[min(seg, len(gripper) - 1)]))
+                last_seg = seg
         ws_send_raw(ws, accid, 'request_servoj', {
             'filter_ratio': SERVOJ_FILTER_RATIO,
             'q': [float(v) for v in traj[i]],
@@ -587,6 +766,124 @@ def stream_trajectory(ws, accid: str, traj: np.ndarray, hz: int):
     return elapsed, state
 
 
+def start_joint_watch(ws_url: str, accid: str, timeout: float = 6.0,
+                      period: float = 0.006):
+    """Poll q/dq/tau on a dedicated connection while a stream runs.
+
+    Taking over servo control is a millisecond-scale event, so the hand-over is
+    invisible to anything that is not already sampling.  That is how a yaw
+    joint parked against its mechanical stop can thump at start-up while every
+    recorded trace looks flat.  tau is kept because a joint driven into a stop
+    shows a sustained torque spike even when the position hardly moves.
+
+    Returns ``(stop_and_join, samples)``.
+    """
+    import threading
+
+    import websocket
+
+    samples = {'t': [], 'q': [], 'dq': [], 'tau': []}
+    stop = threading.Event()
+
+    def run():
+        try:
+            sock = websocket.create_connection(ws_url, timeout=timeout)
+        except Exception as exc:                      # noqa: BLE001
+            print('  [warn] 监控连接失败: %s' % exc)
+            return
+        try:
+            t0 = time.perf_counter()
+            while not stop.is_set():
+                try:
+                    d = _request(sock, accid, 'request_get_joint_state',
+                                 timeout)
+                except Exception:                     # noqa: BLE001
+                    break
+                samples['t'].append(time.perf_counter() - t0)
+                samples['q'].append(np.asarray(d['q'], dtype=np.float64))
+                samples['dq'].append(np.asarray(d.get('dq', [np.nan] * 16),
+                                                dtype=np.float64))
+                samples['tau'].append(np.asarray(d.get('tau', [np.nan] * 16),
+                                                 dtype=np.float64))
+                time.sleep(period)
+        finally:
+            sock.close()
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+
+    def stop_and_join():
+        stop.set()
+        th.join(timeout=3.0)
+
+    return stop_and_join, samples
+
+
+def report_joint_watch(samples: dict, t_takeover, window: float = 0.4):
+    """Summarise a watch around the moment servo control was taken over."""
+    if not samples['t'] or t_takeover is None:
+        print('  [监控] 没采到数据')
+        return
+    T = np.asarray(samples['t'])
+    Q = np.asarray(samples['q'])
+    TAU = np.asarray(samples['tau'])
+    ref = np.median(Q[:3], axis=0)
+    k0 = int(np.searchsorted(T, t_takeover - window))
+    k1 = int(np.searchsorted(T, t_takeover + window))
+    print('  [监控] %d 次采样 / %.2f s (%.0f Hz)；接管瞬间 ±%.0f ms'
+          % (len(T), T[-1], len(T) / max(T[-1], 1e-9), window * 1000))
+    if k1 <= k0:
+        print('         窗口内无采样点')
+        return
+    dev = np.abs(Q[k0:k1] - ref).max(axis=0)
+    j = int(np.argmax(dev))
+    print('         接管窗口内位移最大 : %s %.4f rad (%.2f 度)'
+          % (JOINT_NAMES[j], dev[j], np.degrees(dev[j])))
+    moved = [(JOINT_NAMES[i], float(dev[i])) for i in range(16)
+             if dev[i] > 0.005 and i != j]
+    if moved:
+        # Several joints moving at once, including ones nobody commanded, is
+        # the signature of a whole-robot transient (a drive hand-over) rather
+        # than of one joint misbehaving.
+        print('         窗口内还动过的关节(%d): %s'
+              % (len(moved), ', '.join('%s %.3f' % t for t in moved)))
+    seg = np.abs(TAU[k0:k1])
+    amax = np.unravel_index(int(np.nanargmax(seg)), seg.shape)
+    print('         接管窗口内 |tau| 最大: %.2f  (关节 %s)'
+          % (float(seg[amax]), JOINT_NAMES[amax[1]]))
+    print('         全程 |tau| 最大     : %.2f'
+          % float(np.nanmax(np.abs(TAU))))
+
+    # Print the shapes, not just the peaks: a real excursion rises and falls
+    # across consecutive samples, a bad frame is one point that jumps to an
+    # unrelated value and straight back.  The two need opposite conclusions.
+    tj = int(amax[1])
+    for label, jj in (('位移最大关节', j), ('力矩最大关节', tj)):
+        if not (k0 < k1):
+            continue
+        print('         [%s] %s 的轨迹:' % (label, JOINT_NAMES[jj]))
+        step = max(1, (k1 - k0) // 12)
+        for k in range(k0, k1, step):
+            print('           t%+7.3f   %-9s %8.4f   tau %8.2f'
+                  % (T[k] - t_takeover, JOINT_NAMES[jj], Q[k, jj],
+                     TAU[k, jj]))
+
+
+def servo_summary(stats: dict) -> str:
+    """Describe what came back on a servo socket, faults included.
+
+    ``response_servoj`` says ``success`` even for commands the robot then
+    ignores, so a clean reply count is not evidence of anything; the only
+    server-side failure signal is the ``notify_servoJ`` push.
+    """
+    out = '机器人回 %d 条，非 success %d 条' % (stats['replies'],
+                                                stats['failed'])
+    faults = stats.get('faults') or []
+    if faults:
+        out += '\n      !! 拒绝原因: %s' % '; '.join(faults[:4])
+    return out
+
+
 def interpolate_plan(plan: np.ndarray, dt: float, hz: int) -> np.ndarray:
     """Expand [T, 16] waypoints into the >=500 Hz reference the manual wants.
 
@@ -605,7 +902,31 @@ def interpolate_plan(plan: np.ndarray, dt: float, hz: int) -> np.ndarray:
     return np.asarray(rows, dtype=np.float64)
 
 
-def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0) -> int:
+# How long the reference takes to ease from the freshly measured pose into the
+# first planned waypoint.  ServoJ holds with tau ~ kp * (q_ref - q_actual) and
+# kp reaches 420, so starting a stream from a reference that does not match the
+# arm asks the motor for the whole correction in a single control cycle.  With
+# the arms hanging limp during start-up the gap is at its largest, which is why
+# the thump happens then.
+ENGAGE_SECONDS = 0.4
+
+
+def engage_ramp(target: np.ndarray, fresh: np.ndarray, hz: int,
+                seconds: float = ENGAGE_SECONDS) -> np.ndarray:
+    """Ease from ``fresh`` (just measured) into ``target`` (first waypoint).
+
+    Returns [steps, 16].  The raised-cosine gain has zero slope at both ends,
+    so neither entering the stream nor handing over to the plan introduces a
+    velocity step.
+    """
+    steps = max(int(round(seconds * hz)), 1)
+    u = np.linspace(0.0, 1.0, steps)        # 0 and 1 included, so the first row
+    gain = 0.5 - 0.5 * np.cos(np.pi * u)    # is exactly `fresh` and the last is
+    return fresh + (target - fresh) * gain[:, None]     # exactly `target`
+
+
+def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0,
+               joints=None) -> int:
     """Drive one joint out and back with servoj, watching the encoders follow.
 
     This answers "can servoj actually move the arm" -- every earlier self-test
@@ -624,16 +945,26 @@ def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0) -> int:
           % (hz, WIGGLE_SECONDS, steps))
     print()
 
-    for idx, amp, label in WIGGLE_JOINTS:
+    for idx, amp, label in (joints or WIGGLE_JOINTS):
         lo, hi = JOINT_LIMITS[idx]
-        if not (lo <= base[idx] - amp and base[idx] + amp <= hi):
-            print('--- %s 跳过: ±%.2f 会超出限位 [%.2f, %.2f]'
-                  % (label, amp, lo, hi))
+        traj = out_and_back(base, idx, amp, steps)
+        # Check what the trajectory actually visits, not the symmetric +-amp
+        # band: a one-sided wiggle is legal even when the arm is already parked
+        # against one end of the range (which is where a restart leaves yaw).
+        tmin = float(traj[:, idx].min())
+        tmax = float(traj[:, idx].max())
+        # Never narrow the bounds below where the robot already is: a restart
+        # parks yaw against the stop, reading 1.4822 against a documented 1.48,
+        # and a joint sitting there must still be allowed to move inward.
+        lo = min(lo, float(base[idx]))
+        hi = max(hi, float(base[idx]))
+        if not (lo <= tmin and tmax <= hi):
+            print('--- %s 跳过: 轨迹 [%.3f, %.3f] 超出限位 [%.2f, %.2f]'
+                  % (label, tmin, tmax, lo, hi))
             print()
             continue
 
-        traj = out_and_back(base, idx, amp, steps)
-        peak = int(np.argmax(traj[:, idx]))
+        peak = int(np.argmax(np.abs(traj[:, idx] - traj[0, idx])))
         print('--- %s  ±%.2f rad ---' % (label, amp))
         print('   限位 [%.2f, %.2f]   起点 %.4f   峰值 %.4f (第 %d 条)   '
               '终点 %.4f'
@@ -672,13 +1003,17 @@ def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0) -> int:
         stop.set()
         th.join(timeout=5.0)
 
-        print('   流: %d 条 / %.3f s = 实测 %.0f Hz；机器人回 %d 条，'
-              '非 success %d 条'
+        print('   流: %d 条 / %.3f s = 实测 %.0f Hz；%s'
               % (steps, stream_s, steps / max(stream_s, 1e-9),
-                 servo_stats['replies'], servo_stats['failed']))
+                 servo_summary(servo_stats)))
         if samples['q']:
             q = np.array(samples['q'])
-            ref = q[0, idx]
+            # The first frame off a freshly opened connection can be stale, and
+            # using it as the reference invents a deviation that never happened
+            # (seen on this robot: a phantom 1.10 rad on yaw_L while yaw_L was
+            # commanded constant).  The median of the opening frames is safe.
+            ref_row = np.median(q[:3], axis=0) if len(q) > 2 else q[0]
+            ref = ref_row[idx]
             k = int(np.argmax(np.abs(q[:, idx] - ref)))
             span = max(samples['t'][-1], 1e-9)
             others = np.delete(np.arange(16), idx)
@@ -686,8 +1021,10 @@ def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0) -> int:
             print('   命令 ±%.4f  →  实测偏离 %.4f（第 %.2f s）'
                   % (amp, q[k, idx] - ref, samples['t'][k]))
             print('   结束时相对起点 %.4f' % (q[-1, idx] - ref))
-            print('   其余 15 个关节最大偏离 %.4f'
-                  % float(np.abs(q[:, others] - q[0, others]).max()))
+            dev = np.abs(q[:, others] - ref_row[others]).max(axis=0)
+            k2 = int(np.argmax(dev))
+            print('   其余 15 个关节最大偏离 %.4f   关节=%s'
+                  % (float(dev.max()), JOINT_NAMES[others[k2]]))
         else:
             print('   !! 没采到关节数据')
 
@@ -706,7 +1043,8 @@ def run_wiggle(ws, accid: str, js, ws_url: str, timeout: float = 6.0) -> int:
     return 0
 
 
-def run_selftest(mode: str, ws_url: str, accid: str, timeout: float = 6.0) -> int:
+def run_selftest(mode: str, ws_url: str, accid: str, timeout: float = 6.0,
+                 wiggle_joints=None) -> int:
     """Probe the command channel with a command that asks for no motion.
 
     Every variant sends back the pose the robot already holds, so a correct
@@ -727,7 +1065,7 @@ def run_selftest(mode: str, ws_url: str, accid: str, timeout: float = 6.0) -> in
         print()
 
         if mode == 'wiggle':
-            return run_wiggle(ws, accid, js, ws_url, timeout)
+            return run_wiggle(ws, accid, js, ws_url, timeout, wiggle_joints)
 
         if mode == 'movej':
             data = {'joint': [float(v) for v in js[:14]], 'time': 2}
@@ -761,26 +1099,16 @@ def run_selftest(mode: str, ws_url: str, accid: str, timeout: float = 6.0) -> in
             }
             steps = int(SERVOJ_STREAM_HZ * SERVOJ_STREAM_SECONDS)
             print('>> request_servoj 流  (16 维 = [L7, R7, head2]，恒发当前位置)')
-            print('   %d Hz x %.1fs = %d 条；定节拍、不等响应（与部署同构）'
+            print('   %d Hz x %.1fs = %d 条；定节拍、边发边收（与部署同构）'
                   % (SERVOJ_STREAM_HZ, SERVOJ_STREAM_SECONDS, steps))
             print('   %s' % json.dumps(data))
             print()
-            t0 = time.perf_counter()
-            for step in range(1, steps + 1):
-                ws_send_raw(ws, accid, 'request_servoj', data)
-                target = t0 + step / SERVOJ_STREAM_HZ
-                remaining = target - time.perf_counter()
-                if remaining > 1e-3:
-                    time.sleep(remaining - 1e-3)
-                while time.perf_counter() < target:
-                    pass
-            stream_s = max(time.perf_counter() - t0, 1e-9)
-            print('<< 流结束: %d 条 / %.3f s = 实测 %.0f Hz'
-                  % (steps, stream_s, steps / stream_s))
-            late = ws_drain(ws, 0.5)
-            print('   尾部回收 %d 条消息:' % len(late))
-            for msg in late[:5]:
-                print('     %s' % json.dumps(msg, ensure_ascii=False)[:180])
+            traj = np.tile(np.asarray(js, dtype=np.float64)[:16], (steps, 1))
+            stream_s, servo_stats = stream_trajectory(
+                ws, accid, traj, SERVOJ_STREAM_HZ)
+            print('<< 流结束: %d 条 / %.3f s = 实测 %.0f Hz；%s'
+                  % (steps, stream_s, steps / max(stream_s, 1e-9),
+                     servo_summary(servo_stats)))
         elif mode == 'gripper':
             right = float(claw.get('right_opening', 0.0))
             data = {'right_opening': right, 'right_speed': 100,
@@ -846,6 +1174,10 @@ def main() -> int:
                          '默认 %.2f' % DEFAULT_MAX_REACH)
     ap.add_argument('--chunk-dt', type=float, default=DEFAULT_CHUNK_DT,
                     help='一个动作步的时间(s)，默认 1/30 = %.5f' % DEFAULT_CHUNK_DT)
+    ap.add_argument('--engage-time', type=float, default=ENGAGE_SECONDS,
+                    help='从"发指令前实测位姿"平滑过渡到计划首步的时间(s)，'
+                         '默认 %.1f。用于消除进入伺服时的力矩台阶'
+                         % ENGAGE_SECONDS)
     ap.add_argument('--execute', action='store_true',
                     help='⚠️ 真的把计划下发给机器人（默认关闭：只预览不发送）')
     ap.add_argument('--yes', action='store_true',
@@ -854,7 +1186,31 @@ def main() -> int:
                     help='⚠️ 平滑移动到 --task 对应数据集片段的起始位姿'
                          '（需 --yes 或交互确认）')
     ap.add_argument('--goto-seconds', type=float, default=10.0,
-                    help='--goto-initial 的运动时长(s)，默认 10')
+                    help='--goto-initial 的运动时长(s)；仅当 --goto-vel 为 0 '
+                         '时用作回退值，默认 10')
+    ap.add_argument('--goto-vel', type=float, default=DEFAULT_GOTO_VEL,
+                    help='--goto-initial 的峰值关节速度上限(rad/s)，默认 '
+                         '%.2f；运动时长由距离推导。设为 0 则改用 '
+                         '--goto-seconds' % DEFAULT_GOTO_VEL)
+    ap.add_argument('--goto-stages', type=str, default=None,
+                    help='--goto-initial 分阶段运动的关节分组，用分号分隔各'
+                         '阶段，阶段内用逗号列关节索引，如 "4,5,6;0,1,3;2,9"。'
+                         '默认按 GOTO_STAGES（先腕、再肩肘、最后肩部 yaw）')
+    ap.add_argument('--goto-single', action='store_true',
+                    help='--goto-initial 退回到"所有关节一次插值"（会扫出大弧，'
+                         '可能碰到前面的桌子，仅在你确认路径空旷时用）')
+    ap.add_argument('--goto-only', type=str, default=None,
+                    help='--goto-initial 只跑指定的阶段（逗号分隔，按 1 起编号，'
+                         '如 "1" 或 "1,2"）。用来一步一步验证路径')
+    ap.add_argument('--goto-frac', type=float, default=1.0,
+                    help='--goto-initial 只走该阶段行程的这个比例，默认 1.0。'
+                         '如 0.1 = 只动十分之一，用来先确认方向')
+    ap.add_argument('--wiggle-joint', type=str, default=None,
+                    help='--selftest wiggle 时只摆动这些关节索引（逗号分隔，'
+                         '如 "0,7"）；默认摆 WIGGLE_JOINTS 里的两个。用来实测'
+                         '某个关节的正负方向')
+    ap.add_argument('--wiggle-amp', type=float, default=0.15,
+                    help='--selftest wiggle 的摆动幅度(rad)，默认 0.15')
     ap.add_argument('--selftest',
                     choices=['movej', 'servoj', 'servoj-stream', 'wiggle',
                              'gripper'],
@@ -871,7 +1227,25 @@ def main() -> int:
         print('=' * 74)
         print('  请确认：① 无人正在遥操   ② 手已放在本体硬急停上')
         print()
-        return run_selftest(args.selftest, args.ws, args.accid)
+        joints = None
+        if args.wiggle_joint:
+            joints = []
+            for token in str(args.wiggle_joint).replace(' ', '').split(','):
+                if not token:
+                    continue
+                # "idx=amp" lets each joint pick its own sign, which mirrored
+                # joints need: yaw sits at +1.48 on the left and -1.48 on the
+                # right, so "inward" is negative for one and positive for the
+                # other.
+                if '=' in token:
+                    key, val = token.split('=', 1)
+                    idx, amp = int(key), float(val)
+                else:
+                    idx, amp = int(token), args.wiggle_amp
+                joints.append((idx, amp, 'joint idx%d 方向实测（%+.2f rad）'
+                               % (idx, amp)))
+        return run_selftest(args.selftest, args.ws, args.accid,
+                            wiggle_joints=joints)
 
     tasks = trained_tasks()
     if args.list_tasks:
@@ -889,9 +1263,7 @@ def main() -> int:
             print('!! 找不到 %r 对应的数据集片段' % task)
             return 2
         target14, spread, n_eps = initial_pose_for_task(subset)
-        arm_names = ['abad_L', 'hip_L', 'yaw_L', 'knee_L', 'wy_L', 'wp_L',
-                     'wr_L', 'abad_R', 'hip_R', 'yaw_R', 'knee_R', 'wy_R',
-                     'wp_R', 'wr_R']
+        arm_names = JOINT_NAMES[:14]
 
         ws_goto = websocket.create_connection(args.ws, timeout=6.0)
         try:
@@ -907,8 +1279,57 @@ def main() -> int:
         print('  任务     : %r' % task)
         print('  数据集   : %s  (%d 个片段的首帧均值)' % (subset, n_eps))
         print('  首帧离散度: 最大单关节标准差 %.4f rad（越小越可复现）' % spread)
-        print('  运动时长 : %.1f s，raised-cosine（两端零速度）'
-              % args.goto_seconds)
+
+        if args.goto_single:
+            stages = [('一次插值（全部关节）',
+                       [(i, None) for i in range(14)])]
+        else:
+            stages = (parse_stage_spec(args.goto_stages) if args.goto_stages
+                      else list(GOTO_STAGES))
+        only = None
+        if args.goto_only:
+            only = [int(t) for t in str(args.goto_only).replace(' ', '')
+                    .split(',') if t]
+            bad = [n for n in only if not 1 <= n <= len(stages)]
+            if bad:
+                print('  !! --goto-only 指定的阶段不存在: %s（共 %d 个阶段）'
+                      % (bad, len(stages)))
+                return 2
+            stages = [s for n, s in enumerate(stages, 1) if n in only]
+        vel = args.goto_vel
+        if not vel or vel <= 0:
+            # --goto-vel 0 means "read --goto-seconds as the duration".
+            secs = goto_seconds_for(target14, cur16, None, args.goto_seconds)
+            span0 = float(np.abs(target14 - cur16[:14]).max())
+            vel = max(span0 * np.pi / (2.0 * secs), 1e-3)
+        _, stage_plan = stage_goto(cur16, target14, stages, vel,
+                                   SERVOJ_STREAM_HZ, args.goto_frac)
+        total_s = sum(sec for _, _, sec in stage_plan)
+        covered = {i for _, pairs, _ in stage_plan for i, _ in pairs}
+        missed = [arm_names[i] for i in range(14)
+                  if abs(target14[i] - cur16[i]) > 1e-9 and i not in covered]
+        print('  运动时长 : %.1f s，分 %d 阶段（每阶段 raised-cosine 两端零速度）'
+              % (total_s, len([1 for _, _, sec in stage_plan if sec > 0])))
+        print('  峰值关节速度上限: %.3f rad/s = %.1f 度/s'
+              % (vel, np.degrees(vel)))
+        if only is not None:
+            print('  ⚠️  本次只跑第 %s 阶段，其余阶段这轮不动'
+                  % ','.join(str(n) for n in only))
+        if args.goto_frac < 1.0:
+            print('  ⚠️  本次只走 %.0f%% 的行程（先确认方向，不走到目标）'
+                  % (args.goto_frac * 100))
+        print()
+        print('  阶段顺序（"(临时)" = 中途躲避位置，不是最终目标）：')
+        for label, pairs, sec in stage_plan:
+            print('    %s   %.1f s' % (label, sec))
+            for i, v in pairs:
+                tag = '' if abs(v - target14[i]) < 1e-9 else '   (临时)'
+                print('        %-9s %8.3f -> %8.3f%s'
+                      % (arm_names[i], cur16[i], v, tag))
+        if missed and only is None:
+            print()
+            print('  !! 以下关节需要移动但未被任何阶段覆盖，将保持不动：')
+            print('     %s' % ' '.join(missed))
         print()
         print('  %-8s %10s %10s %10s  %-16s %s'
               % ('关节', '当前', '目标', 'Δ', '限位', '检查'))
@@ -936,26 +1357,45 @@ def main() -> int:
                 print('   未确认，未发送任何指令。')
                 return 3
 
-        traj = ease_to_pose(cur16, target14, args.goto_seconds,
-                            SERVOJ_STREAM_HZ)
+        # The table above was built from a pose read before the confirmation
+        # prompt, so it can be seconds stale by the time we stream.  ServoJ
+        # holds with tau ~ kp * (q_ref - q_actual), so a stale reference leaves
+        # a gap that the first message asks the motor to close in one cycle.
+        # Re-read here and rebuild the trajectory from what the robot says now.
         ws_goto = websocket.create_connection(args.ws, timeout=6.0)
         try:
+            fresh = np.asarray(
+                _request(ws_goto, args.accid, 'request_get_joint_state',
+                         6.0)['q'], dtype=np.float64)[:16]
+            drift = float(np.abs(fresh[:14] - cur16[:14]).max())
+            if drift > 1e-4:
+                print('  确认期间手臂移动了 %.4f rad，已按新位姿重建轨迹'
+                      % drift)
+            traj, _ = stage_goto(fresh, target14, stages, vel,
+                                 SERVOJ_STREAM_HZ, args.goto_frac)
+            stop_watch, watch = start_joint_watch(args.ws, args.accid)
+            time.sleep(0.5)                 # baseline before control is taken
+            t_takeover = watch['t'][-1] if watch['t'] else None
             stream_s, servo_stats = stream_trajectory(ws_goto, args.accid,
                                                       traj, SERVOJ_STREAM_HZ)
-            time.sleep(0.3)
+            time.sleep(0.4)
+            stop_watch()
             after = np.asarray(
                 _request(ws_goto, args.accid, 'request_get_joint_state',
                          6.0)['q'], dtype=np.float64)[:16]
         finally:
             ws_goto.close()
         print()
-        print('  [执行] %d 条 @ %d Hz，流 %.3f s (实测 %.0f Hz)；机器人回 %d 条，'
-              '非 success %d 条'
+        print('  [执行] %d 条 @ %d Hz，流 %.3f s (实测 %.0f Hz)；%s'
               % (traj.shape[0], SERVOJ_STREAM_HZ, stream_s,
                  traj.shape[0] / max(stream_s, 1e-9),
-                 servo_stats['replies'], servo_stats['failed']))
-        print('  实测相对目标 max|Δ|: %.4f rad'
-              % float(np.abs(after[:14] - target14).max()))
+                 servo_summary(servo_stats)))
+        # Compare against where THIS run was aiming, not the overall target:
+        # with --goto-only or --goto-frac the run deliberately stops short, and
+        # measuring against the final pose would look like a huge error.
+        print('  实测相对【本轮终点】 max|Δ|: %.4f rad'
+              % float(np.abs(after[:14] - traj[-1][:14]).max()))
+        report_joint_watch(watch, t_takeover)
         print('  执行后 /joint_states(16): %s'
               % np.array2string(after, precision=4))
         return 0
@@ -1089,17 +1529,44 @@ def main() -> int:
         print()
 
         if args.execute and ws_servo is not None:
+            # Anchor the stream to the pose the robot is in *right now*, not the
+            # pose the observation was taken at.  Inference sits between the two
+            # (2.6 s on the first chunk) and the arms hang limp during start-up,
+            # so they sag in that gap; starting from plan[0] would ask the motor
+            # for the whole correction in one cycle.
+            fresh = np.asarray(read_robot_state(args.ws, args.accid)[0][:16],
+                               dtype=np.float64)
+            gap = float(np.abs(fresh - cur16).max())
             ref = interpolate_plan(plan, args.chunk_dt, SERVOJ_STREAM_HZ)
+            head = engage_ramp(ref[0], fresh, SERVOJ_STREAM_HZ,
+                               args.engage_time)
+            sub_steps = max(int(round(args.chunk_dt * SERVOJ_STREAM_HZ)), 1)
+            grip = None
+            if args.send_gripper:
+                grip = np.clip(actions[:, 17], 0.0, 1.0)
+                # Hold the gripper through the engage ramp so its segment index
+                # stays aligned with the action steps.
+                head_segs = int(round(head.shape[0] / sub_steps))
+                grip = np.concatenate([np.full(head_segs, grip[0]), grip])
+                print('  [执行] 夹爪：右夹爪 %d 个 waypoint，目标 %.2f~%.2f '
+                      '(硬件 %.0f~%.0f)'
+                      % (len(grip), grip.min(), grip.max(),
+                         grip.min() * GRIPPER_SCALE,
+                         grip.max() * GRIPPER_SCALE))
+            ref = np.vstack([head, ref])
+            print('  [执行] 位姿锚定: 推理后偏差 %.4f rad -> 用 %.2f s 平滑衔接'
+                  % (gap, args.engage_time))
             print('  [执行] servoj %d 个 waypoint -> %d 条 @ %d Hz (%.2f s)'
                   % (plan.shape[0], ref.shape[0], SERVOJ_STREAM_HZ,
                      ref.shape[0] / SERVOJ_STREAM_HZ))
-            stream_s, servo_stats = stream_trajectory(ws_servo, args.accid,
-                                                      ref, SERVOJ_STREAM_HZ)
+            stream_s, servo_stats = stream_trajectory(
+                ws_servo, args.accid, ref, SERVOJ_STREAM_HZ,
+                gripper=grip, sub_steps=sub_steps)
             time.sleep(0.2)
             after = read_robot_state(args.ws, args.accid)[0]
-            print('     流 %.3f s (实测 %.0f Hz)；机器人回 %d 条，非 success %d 条'
+            print('     流 %.3f s (实测 %.0f Hz)；%s'
                   % (stream_s, ref.shape[0] / max(stream_s, 1e-9),
-                     servo_stats['replies'], servo_stats['failed']))
+                     servo_summary(servo_stats)))
             print('     执行后 /joint_states(16): %s'
                   % np.array2string(after, precision=4))
             print('     实测相对计划末端 max|Δ|: %.4f rad'
