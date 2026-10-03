@@ -184,11 +184,9 @@ train_dataloader = dict(
             dict(
                 type='ParquetDatasetV3',
                 data_root_path=[  # noqa: E501
-                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-09-28_22-05-37',  # noqa: E501
-                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-09-28_22-26-43',  # noqa: E501
-                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-09-28_22-36-10',  # noqa: E501
-                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-09-28_22-44-32',  # noqa: E501
-                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-09-28_22-54-05',  # noqa: E501
+                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-10-02_22-55-58',  # noqa: E501
+                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-10-02_23-24-38',  # noqa: E501
+                './datasets/RealRobot_Tron2_lerobot/lerobot_2026-10-02_23-53-41',  # noqa: E501
             ],
                 transforms=[
                     dict(
@@ -248,7 +246,7 @@ runner = dict(
     # 用 17000 而非 16600 是为了能被 save_iter_interval 整除：
     # 步骤态下只有 save_iter_interval 一条保存路径，且训练循环结束时
     # 【没有】收尾保存，不整除则最后一步不会落盘。
-    max_steps=17000,
+    max_steps=25000,
     # 每 1000 步滚动保存。注意单份检查点约 29.2 GB
     # (.pt 14.75 GB + .safetensors 14.47 GB，两者内容重复)。
     save_iter_interval=1000,
@@ -258,11 +256,11 @@ runner = dict(
     # 3 samples/GPU x 8 accumulation steps = effective batch 24。
     # 厂商原版是 8 samples/GPU x 4 GPUs x 2 accum = batch 64，
     # 单卡 24G 装不下 micro-batch 8，故用累积等效缩小。
-    grad_accumulation_steps=8,
+    grad_accumulation_steps=16,
     seed=42,
     optimizer=dict(
         type='AdamW',
-        lr=2.5e-5,
+        lr=1e-4,
         betas=(0.9, 0.95),
         eps=1e-8,
         weight_decay=1e-10,
@@ -287,8 +285,8 @@ runner = dict(
         warmup_steps=1000,
         # 与 max_steps 一致，让余弦退火在训练结束时刚好收敛到 min_lr
         # （完整退火），比厂商"decay_steps > max_steps"的半程退火更友好。
-        decay_steps=17000,
-        min_lr=2.5e-6),
+        decay_steps=25000,
+        min_lr=1e-6),
     tokenizer=dict(
         type='PretrainedTokenizer',
         model_path=  # noqa: E251
@@ -297,7 +295,10 @@ runner = dict(
     ),
     metric=dict(
         type='VLAMetric',
-        active_trackers=('jsonl',),
+        # jsonl 保持每步一条；csv 每 100 步一行，整行包含 push() 的全部指标
+        # （loss / loss_raw / l1_loss / action_accuracy / lr / step_time 等）。
+        active_trackers=('jsonl', 'csv'),
+        csv_interval=100,
         run_dir='work_dirs',
         window_size=1),
     enable_gradient_checkpointing=True,

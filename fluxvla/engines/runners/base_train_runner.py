@@ -656,6 +656,12 @@ class BaseTrainRunner(ABC):
                     if os.path.exists(sf_path):
                         os.remove(sf_path)
                         overwatch.info(f'Removed old safetensors: {sf_file}')
+                    adapter_file = old_ckpt.replace(
+                        '.pt', '-adapter.safetensors')
+                    adapter_path = os.path.join(checkpoint_dir, adapter_file)
+                    if os.path.exists(adapter_path):
+                        os.remove(adapter_path)
+                        overwatch.info(f'Removed old adapter: {adapter_file}')
                 except Exception as e:
                     overwatch.warning(
                         f'Failed to remove checkpoint {old_ckpt}: {e}')

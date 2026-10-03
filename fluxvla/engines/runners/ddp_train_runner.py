@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: MIT
 # Notes: Attribution normalized; no functional change.
 import os
+import shutil
 from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
@@ -166,6 +167,93 @@ class DDPTrainRunner(BaseTrainRunner):
         self.distributed_state = overwatch.distributed_state
         self.recent_losses = deque(maxlen=self.grad_accumulation_steps)
 
+    def _resolve_lora_adapter_path(self) -> Optional[str]:
+        """Locate the LoRA adapter saved next to the resumed checkpoint."""
+        candidates = []
+        if self.resume_from:
+            resume_path = os.path.abspath(str(self.resume_from))
+            checkpoint_dir = os.path.dirname(resume_path)
+            run_dir = os.path.dirname(checkpoint_dir)
+            stem = os.path.basename(resume_path)
+            if stem.endswith('.pt'):
+                stem = stem[:-len('.pt')]
+            candidates.append(
+                os.path.join(checkpoint_dir, f'{stem}-adapter.safetensors'))
+            candidates.append(
+                os.path.join(run_dir, 'adapter_model.safetensors'))
+        work_dir = getattr(getattr(self, 'args', None), 'work_dir', None)
+        if work_dir:
+            candidates.append(
+                os.path.join(str(work_dir), 'adapter_model.safetensors'))
+        metric_run_dir = getattr(self.metric, 'run_dir', None)
+        if metric_run_dir:
+            candidates.append(
+                os.path.join(str(metric_run_dir),
+                             'adapter_model.safetensors'))
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _load_lora_adapter_state(self) -> bool:
+        """Restore the PEFT adapter that belongs to the checkpoint.
+
+        LoRA checkpoints hold merged weights produced by
+        ``merge_and_unload()``, which no longer carry the ``base_layer`` /
+        ``lora_*`` keys the live PEFT model expects.  Loading them with
+        ``strict=False`` silently drops every tensor, so the adapter saved
+        alongside the checkpoint is the authoritative restore source.
+        """
+        adapter_path = self._resolve_lora_adapter_path()
+        if adapter_path is None:
+            return False
+
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+
+        target = self.vla.module if isinstance(self.vla, DDP) else self.vla
+        load_result = set_peft_model_state_dict(
+            target, load_file(adapter_path))
+        if overwatch.is_rank_zero():
+            missing = list(
+                getattr(load_result, 'missing_keys', None) or [])
+            unexpected = list(
+                getattr(load_result, 'unexpected_keys', None) or [])
+            overwatch.info(
+                f'LoRA adapter restored from {adapter_path} '
+                f'({len(missing)} missing, {len(unexpected)} unexpected)')
+            if missing or unexpected:
+                overwatch.warning(
+                    f'LoRA adapter key mismatch -> '
+                    f'missing={missing[:5]} unexpected={unexpected[:5]}')
+        return True
+
+    @staticmethod
+    def _remap_merged_checkpoint_keys(checkpoint_model_state, target_keys):
+        """Map merged (LoRA-folded) keys onto a PEFT-wrapped state dict."""
+        remapped, unmatched = {}, []
+        for key, value in checkpoint_model_state.items():
+            if key in target_keys:
+                remapped[key] = value
+                continue
+            prefix, _, last = key.rpartition('.')
+            candidates = []
+            if prefix:
+                candidates.extend([
+                    f'base_model.model.{prefix}.base_layer.{last}',
+                    f'base_model.model.{prefix}'
+                    f'.modules_to_save.default.{last}',
+                    f'{prefix}.base_layer.{last}',
+                ])
+            candidates.append(f'base_model.model.{key}')
+            for candidate in candidates:
+                if candidate in target_keys:
+                    remapped[candidate] = value
+                    break
+            else:
+                unmatched.append(key)
+        return remapped, unmatched
+
     def _load_model_state(self, checkpoint_model_state: dict) -> None:
         """Load DDP model state from checkpoint.
 
@@ -175,15 +263,28 @@ class DDPTrainRunner(BaseTrainRunner):
         if overwatch.is_rank_zero():
             overwatch.info('Loading DDP model state')
 
-        # Load model state dict (DDP-specific)
-        if isinstance(self.vla, DDP):
-            self.vla.module.load_state_dict(
-                checkpoint_model_state, strict=False)
-        else:
-            self.vla.load_state_dict(checkpoint_model_state, strict=False)
+        target = self.vla.module if isinstance(self.vla, DDP) else self.vla
 
+        # LoRA runs: the checkpoint stores merged weights, so the adapter
+        # written beside it is the only faithful restore path.
+        if self._model_uses_lora() and self._load_lora_adapter_state():
+            if overwatch.is_rank_zero():
+                overwatch.info('DDP model state restored from checkpoint')
+            return
+
+        target_keys = set(target.state_dict().keys())
+        remapped, unmatched = self._remap_merged_checkpoint_keys(
+            checkpoint_model_state, target_keys)
+        if remapped:
+            target.load_state_dict(remapped, strict=False)
         if overwatch.is_rank_zero():
-            overwatch.info('DDP model state restored from checkpoint')
+            overwatch.info(
+                f'DDP model state restored from checkpoint: '
+                f'{len(remapped)} matched, {len(unmatched)} unmatched')
+            if unmatched:
+                overwatch.warning(
+                    f'Unmatched checkpoint tensors (first 5): '
+                    f'{unmatched[:5]}')
 
     def _model_uses_lora(self) -> bool:
         return bool(getattr(self.cfg.model, 'use_lora', False))
@@ -474,6 +575,17 @@ class DDPTrainRunner(BaseTrainRunner):
             safetensors_path = checkpoint_path.replace('.pt', '.safetensors')
             self._save_model_safetensors(model_state_dict, safetensors_path)
             overwatch.info(f'Saved safetensors at: {safetensors_path}')
+
+            # Keep a step-tagged adapter copy so that resuming from an older
+            # checkpoint restores the adapter weights of that same step.
+            adapter_src = os.path.join(save_dir, 'adapter_model.safetensors')
+            if os.path.isfile(adapter_src):
+                adapter_dst = os.path.join(
+                    checkpoint_dir,
+                    checkpoint_name.replace('.pt', '-adapter.safetensors'))
+                shutil.copy2(adapter_src, adapter_dst)
+                overwatch.info(
+                    f'Saved step-tagged adapter at: {adapter_dst}')
 
             # Create/update latest checkpoint symlink
             latest_ckpt_link = os.path.join(checkpoint_dir,

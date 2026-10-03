@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: MIT
 # Notes: Attribution normalized; no functional change.
 
+import csv
 import os
 import time
 from collections import defaultdict, deque
@@ -62,6 +63,61 @@ class JSONLinesTracker:
                 mode='a',
                 sort_keys=True) as js_tracker:
             js_tracker.write(metrics)
+
+    def finalize(self) -> None:
+        return
+
+
+class CSVTracker:
+    """Append training metrics to a CSV file every ``interval`` steps.
+
+    Unlike :class:`JSONLinesTracker`, which records every global step, this
+    tracker only writes one row every ``interval`` steps so the resulting
+    table stays short and easy to inspect. Columns are taken from the first
+    recorded row and extended automatically if a later step introduces new
+    metric keys.
+    """
+
+    def __init__(self, run_id: str, run_dir: str,
+                 hparams: Dict[str, Any], interval: int = 100) -> None:
+        self.run_id, self.run_dir, self.hparams = run_id, run_dir, hparams
+        self.interval = max(int(interval), 1)
+        self.path = os.path.join(run_dir, f'{self.run_id}.csv')
+        self.fieldnames: Optional[list] = None
+        self.rows: list = []
+
+    @overwatch.rank_zero_only
+    def write_hyperparameters(self) -> None:
+        return
+
+    @overwatch.rank_zero_only
+    def write(self, global_step: int,
+              metrics: Dict[str, Union[int, float]]) -> None:
+        if global_step % self.interval != 0:
+            return
+        row = dict(metrics)
+        if self.fieldnames is None:
+            self.fieldnames = list(row.keys())
+            with open(self.path, 'w', newline='', encoding='utf-8') as handle:
+                csv.DictWriter(
+                    handle, fieldnames=self.fieldnames).writeheader()
+        else:
+            extra = [key for key in row if key not in self.fieldnames]
+            if extra:
+                self.fieldnames.extend(extra)
+                self._rewrite()
+        with open(self.path, 'a', newline='', encoding='utf-8') as handle:
+            csv.DictWriter(
+                handle, fieldnames=self.fieldnames,
+                extrasaction='ignore').writerow(row)
+        self.rows.append(row)
+
+    def _rewrite(self) -> None:
+        with open(self.path, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=self.fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(self.rows)
 
     def finalize(self) -> None:
         return
@@ -197,6 +253,8 @@ class VLAMetric:
             accumulation steps. Defaults to 1.
         window_size (int, optional): Size of the window for smoothing.
             Defaults to 1.
+        csv_interval (int, optional): Write one row to the CSV tracker every
+            this many global steps. Defaults to 100.
         resume_step (Optional[int], optional): Step to resume from.
             Defaults to None.
         resume_epoch (Optional[int], optional): Epoch to resume from.
@@ -219,6 +277,7 @@ class VLAMetric:
         resume_step: Optional[int] = None,
         resume_epoch: Optional[int] = None,
         update_step_time: bool = True,
+        csv_interval: int = 100,
     ) -> None:
         self.update_step_time = update_step_time
         self.grad_accumulation_steps = max(int(grad_accumulation_steps), 1)
@@ -233,6 +292,9 @@ class VLAMetric:
         for tracker_type in active_trackers:
             if tracker_type == 'jsonl':
                 tracker = JSONLinesTracker(run_id, run_dir, hparams)
+            elif tracker_type == 'csv':
+                tracker = CSVTracker(
+                    run_id, run_dir, hparams, interval=csv_interval)
             elif tracker_type == 'wandb':
                 tracker = WeightsBiasesTracker(
                     run_id, run_dir, hparams, group='vla-train')

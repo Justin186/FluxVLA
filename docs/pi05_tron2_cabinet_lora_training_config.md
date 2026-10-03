@@ -3,6 +3,7 @@
 > 配置文件：`configs/pi05/pi05_paligemma_tron2_cabinet_lora.py`
 > 归一化统计：`datasets/RealRobot_Tron2_lerobot/tron2_stats_armsymmetric.json`
 > 文档更新时间：2026-09-29（含归一化修正、磁盘运维、部署链路）
+> 增补：2026-10-03 —— 检查点/续训修复与 csv 训练指标，见第 13 章
 > 当前状态：v2b 训练运行中（step 597 / 17000，中位 loss 0.064，无尖峰）
 
 ---
@@ -21,10 +22,11 @@
 10. [性能与时间预算](#性能与时间预算)
 11. [磁盘与运维（回收站陷阱）](#磁盘与运维回收站陷阱)
 12. [启动与恢复](#启动与恢复)
-13. [已知坑与必读注意事项](#已知坑与必读注意事项)
-14. [**部署链路**](#部署链路)
-15. [监控与产物](#监控与产物)
-16. [训练历史与对照实验](#训练历史与对照实验)
+13. [**检查点、续训与训练监控**](#检查点续训与训练监控)
+14. [已知坑与必读注意事项](#已知坑与必读注意事项)
+15. [**部署链路**](#部署链路)
+16. [监控与产物](#监控与产物)
+17. [训练历史与对照实验](#训练历史与对照实验)
 
 ---
 
@@ -870,6 +872,155 @@ i=0; while pgrep -f "train.py --config configs/pi05/pi05_paligemma_tron2_cabinet
 
 ---
 
+## 检查点、续训与训练监控
+
+> 本节记录 **2026-10-03** 的排查与修复。**在此日期之前，LoRA 训练的 `--resume-from` 是不可用的**——它会静默丢弃全部 LoRA 权重（见下文）。
+
+### 存档产物
+
+每 `save_iter_interval` 步保存一次，在 `work_dirs/<run>/` 下写出：
+
+| 路径 | 内容 | 大小 |
+|---|---|---|
+| `checkpoints/step-XXXXXX-epoch-XXX-loss=X.XXXX.pt` | 模型权重 + **优化器状态** + scheduler + global_step + epoch | ≈ 14.75 GB |
+| `checkpoints/step-XXXXXX-…safetensors` | 合并后的模型权重（推理用） | ≈ 14.47 GB |
+| `checkpoints/step-XXXXXX-…-adapter.safetensors` | 与该 step 同步的 LoRA 适配器副本 | ≈ 145 MB |
+| `checkpoints/latest-checkpoint.{pt,safetensors}` | 指向最新一份的软链（不参与滚动） | — |
+| `adapter_model.safetensors` + `adapter_config.json` | 最新 LoRA 适配器（每次保存覆盖） | ≈ 145 MB |
+| `tokenizer/`、`llm_backbone_config.json`、`README.md` | 配套文件（覆盖写，只有一份） | 小 |
+| `<run_id>.jsonl` / `<run_id>.csv` | 训练指标（见下文「训练指标文件」） | 几 MB / 几十 KB |
+
+**滚动清理**：`max_keep_ckpts=3`，按 mtime 删除最旧的 `.pt`，并同步删除同名 `.safetensors` 与 `-adapter.safetensors`。稳态占用 3 × 29.2 GB ≈ **87.6 GB**，保存瞬间峰值 ≈ **116.8 GB**。
+
+### 为什么 LoRA 存档是「合并后」格式
+
+`.pt` / `.safetensors` 里的 `model` 来自 `merge_and_unload()`：
+
+```python
+base_vla = build_vla_from_cfg(self.cfg.model)
+base_vla.from_pretrained()
+merged_vla = PeftModel.from_pretrained(base_vla, save_dir)
+merged_vla = merged_vla.merge_and_unload()
+model_state_dict = merged_vla.state_dict()
+```
+
+得到的是 **LoRA 已折进 base 的普通权重**，key 形如：
+
+```
+llm_backbone.layers.0.mlp.down_proj.weight
+```
+
+而运行时模型被 PEFT 包装，key 形如：
+
+```
+base_model.model.llm_backbone.layers.0.mlp.down_proj.base_layer.weight
+base_model.model.llm_backbone.layers.0.mlp.down_proj.lora_A.default.weight
+base_model.model.llm_backbone.layers.0.mlp.down_proj.lora_B.default.weight
+```
+
+**两者逐字不匹配。**
+
+### ⚠️ 历史 bug：续训静默丢掉全部 LoRA 权重
+
+修复前 `ddp_train_runner._load_model_state` 是：
+
+```python
+self.vla.module.load_state_dict(checkpoint_model_state, strict=False)
+```
+
+`strict=False` 遇到上面那种 key 全不匹配的情况，**不报错、只丢弃**。实测 812 个张量一个都没加载进去，模型退回「原始 `pi05_base_bf16` + 随机初始化 LoRA」。
+
+2026-10-03 实测对比：
+
+| | 第一步 loss |
+|---|---|
+| 原训练 step 999（中断前） | 0.0106 |
+| **修复前**续训 step 1001 | **0.3888**（≈ 训练起点 0.43） |
+| **修复后**续训 step 1001 | **0.0100** ✅ |
+
+**最阴险的地方**：优化器状态恢复是正常的（日志 `Matched 830/838`），错配的 Adam 动量会把参数快速拉回，loss 会在十几步内从 0.39 回落到 0.05 上下——**看起来"训练正常"，实际上前面 1000 步的 LoRA 成果已经丢了。**
+
+### 修复后的恢复顺序
+
+`_load_model_state` 现在按优先级恢复：
+
+1. **LoRA 模式优先走 adapter**：用 `peft.set_peft_model_state_dict` 加载与检查点**同 step** 的 `-adapter.safetensors`（找不到则回退到 run 根目录的 `adapter_model.safetensors`）。这样 base（`pi05_base_bf16`）+ LoRA + 优化器三者完全自洽。
+   - `missing_keys` 只会剩下 `base_layer` / `original_module` / 未包装层（如 `patch_embedding`），它们由 `from_pretrained()` 提供，**属正常**。
+2. **兜底**：adapter 不存在时，用 `_remap_merged_checkpoint_keys` 把合并 key 映射到 `base_model.model.<path>.base_layer.<param>`，而不是静默丢弃。
+
+启动时会明确打印：
+
+```
+LoRA adapter restored from .../step-001000-epoch-000-loss=0.0409-adapter.safetensors
+```
+
+### 训练指标文件（jsonl / csv）
+
+`metric` 配置：
+
+```python
+metric=dict(
+    type='VLAMetric',
+    active_trackers=('jsonl', 'csv'),
+    csv_interval=100,
+    run_dir='work_dirs',
+    window_size=1,
+)
+```
+
+| 文件 | 频率 | 说明 |
+|---|---|---|
+| `<run_id>.jsonl` | **每步**一条 | 全量指标，`run_id` = config 名 + 启动时间戳 |
+| `<run_id>.csv` | **每 100 步**一行 | 便于肉眼/Excel 查看，列与 jsonl 相同，遇新列自动扩展 |
+
+csv 列（当前配置 8 列）：
+
+```
+VLA Train/Step, Epoch, Loss, L1 Loss, Action Token Accuracy,
+Loss (Raw), Learning Rate, Step Time
+```
+
+> `L1 Loss` 与 `Action Token Accuracy` 在当前 π0.5 流匹配实现下恒为 0（模型不产出这两个量）。关注 `Loss` / `Loss (Raw)` / `Learning Rate` / `Step Time` 即可。
+> csv 在第 100 步之前**不会创建文件**，属正常。
+
+### 续训命令
+
+```bash
+cd /home/lab/tron_ws/FluxVLA
+export WANDB_MODE=disabled TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+/home/lab/miniconda3/envs/fluxvla/bin/torchrun \
+  --standalone --nnodes 1 --nproc-per-node 2 \
+  scripts/train.py \
+  --config configs/pi05/pi05_paligemma_tron2_cabinet_lora.py \
+  --work-dir work_dirs/tron2_buttons_v2 \
+  --resume-from work_dirs/tron2_buttons_v2/checkpoints/step-001000-epoch-000-loss=0.0409.pt
+```
+
+注意事项：
+
+- **必须用 `.pt`**（含优化器/调度器状态），不是 `.safetensors`。
+- `pod_scripts/train_tron2_buttons.sh` **不支持 `--resume-from`**，续训要直接跑 `torchrun`。该脚本会就地 patch config，所以 config 已是可用状态，直接跑即可。
+- 续训会生成**新的** `<时间戳>.jsonl` / `.csv`（`run_id` 含启动时间戳），**不会追加**到旧文件。看完整曲线需要把两段接起来。
+- `run-metrics.jsonl` 会被新进程覆盖重写（不含曲线，无影响）。
+- `global_step` 从检查点继续，通常无需改 `max_steps`。
+
+### 判断续训是否正常
+
+只看**第一步的 loss**：
+
+```bash
+tr '\r' '\n' < 训练日志 | grep "Global Step" | head -5
+```
+
+| 现象 | 结论 |
+|---|---|
+| 第一步 loss ≈ 中断前的量级（如 0.01） | ✅ 权重正确恢复 |
+| 第一步 loss ≈ 训练起点（0.3 ~ 0.4） | ❌ 权重没恢复（就是上面那个 bug） |
+
+---
+
 ## 已知坑与必读注意事项
 
 ### 1. 必须用 torchrun（否则 AttributeError）
@@ -1033,7 +1184,17 @@ states    : (B, 32)
 | 云服务器 + ZMQ | 4090 D | 211 KB/请求（可优化到 38 KB） | ✅ 可行，需 ≥5 Mbps 上行 |
 | Orin 板端 | 弱很多 | 0 | 算力是瓶颈 |
 
-> **两卡工作站的两卡带宽不一致不影响部署** —— 推理只需要 1 张卡。"两卡并行比单卡还慢"是**训练**特有的问题（DDP 每步 all-reduce 同步梯度，整体速度由最慢的卡决定）。推理是单卡串行前向，与第二张卡无关。
+> **两卡工作站的两卡带宽不一致不影响部署** —— 推理只需要 1 张卡，单卡串行前向，与第二张卡无关。
+>
+> ⚠️ **训练侧更正（2026-10-02 实测）**：这里原先写的"两卡并行比单卡还慢"**在 LoRA 配置下不成立**。
+> GPU1 确实只有 PCIe 3.0 ×1（跨卡实测 0.82 GB/s），但 **LoRA 的梯度同步量极小，那条链路根本喂不满** ——
+> 实测双卡 **1.84× 加速（92% 线性）**，每步只多 0.29 s（8%）。
+>
+> **"双卡更慢"只在全量微调口径下成立**：那时每步要同步 3B × fp32 = 12 GB 梯度，
+> ring all-reduce ≈ 24 GB 流量 ÷ 0.82 GB/s ≈ **29 秒/步**，而一步算力本身只要 3.5 秒。
+>
+> 另需注意：**双卡不缩短单步，它让每步吃 2 倍数据** —— 要省总时长必须同时把 `max_steps` 减半
+> （并同步改 `decay_steps`）。完整实测见 **`docs/tron2_dual_gpu_training_throughput.md`**。
 
 #### 若用云服务器，图像开销可大幅压缩
 
