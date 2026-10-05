@@ -45,7 +45,10 @@ import uuid
 
 import numpy as np
 
-REPO = os.environ.get('FLUXVLA_ROOT', '/home/lab/tron_ws/FluxVLA')
+# 仓库根目录：默认取本脚本所在目录的上一级，任何机器都能跑；用 FLUXVLA_ROOT 覆盖
+REPO = os.environ.get(
+    'FLUXVLA_ROOT',
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
 CAMERAS = ['cam_high', 'cam_left_wrist', 'cam_right_wrist']

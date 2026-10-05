@@ -30,18 +30,23 @@ set -euo pipefail
 
 BASE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FV="$BASE"
-TORCHRUN=${FLUXVLA_TORCHRUN:-/home/lab/miniconda3/envs/fluxvla/bin/torchrun}
+# 机器相关路径一律自动探测，换机器不用改脚本；需要指定时用 FLUXVLA_TORCHRUN 覆盖。
+# 顺序：环境变量 -> 当前 python3 同目录（即已激活的 conda 环境）-> PATH
+TORCHRUN=${FLUXVLA_TORCHRUN:-$(dirname "$(command -v python3 2>/dev/null || echo /usr/bin/python3)")/torchrun}
+[ -x "$TORCHRUN" ] || TORCHRUN=$(command -v torchrun 2>/dev/null || true)
 CONFIG=configs/pi05/pi05_paligemma_tron2_cabinet_lora.py
 
 NPROC=${NPROC:-2}
 WORK_DIR=${WORK_DIR:-$FV/work_dirs/tron2_buttons_v2}
-LOG=${LOG:-/home/lab/tron_ws/logs/train_buttons_v2_resume.log}
+# 默认放仓库同级的 logs/ 下，与原来 <repo 上级>/logs/ 的布局一致
+LOG=${LOG:-$(dirname "$FV")/logs/train_buttons_v2_resume.log}
 DRY_RUN=${DRY_RUN:-0}
 STEP=${1:-}
 
 fail() { echo "[FAIL] $*" >&2; exit 1; }
 
-[ -x "$TORCHRUN" ] || fail "找不到 torchrun: $TORCHRUN"
+[ -x "$TORCHRUN" ] || fail \
+  "找不到 torchrun（探测结果 '${TORCHRUN}'）。请先 'conda activate fluxvla'，或设 FLUXVLA_TORCHRUN 指向它"
 CKPT_DIR="$WORK_DIR/checkpoints"
 [ -d "$CKPT_DIR" ] || fail "找不到检查点目录: $CKPT_DIR"
 

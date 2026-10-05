@@ -28,6 +28,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+# 仓库根目录：本脚本在 <repo>/scripts/ 下，取上一级即可，任何机器都成立
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 KEEP_DIM = 16
 
 # 各类不可见字符：零宽空格、BOM、方向标记等
@@ -395,8 +398,10 @@ def process_dataset(src, dst, drop_first=3):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="/home/lab/tron_ws/datasets_raw")
-    ap.add_argument("--dst", default="/home/lab/tron_ws/FluxVLA/datasets/RealRobot_Tron2_lerobot")
+    ap.add_argument("--src", default=os.path.join(
+        os.path.dirname(_REPO), 'datasets_raw'))
+    ap.add_argument("--dst", default=os.path.join(
+        _REPO, 'datasets/RealRobot_Tron2_lerobot'))
     ap.add_argument("--drop-first", default="auto",
                     help="丢掉每条 episode 开头相机未出图的帧数；"
                          "'auto'=逐段扫描自适应（默认），或给整数固定丢弃")

@@ -30,7 +30,10 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-FV = '/home/lab/tron_ws/FluxVLA'
+# 仓库根目录：默认取本脚本所在目录的上一级，任何机器都能跑；可用 FLUXVLA_ROOT 覆盖
+FV = os.environ.get(
+    'FLUXVLA_ROOT',
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_CFG = os.path.join(
     FV, 'configs/pi05/pi05_paligemma_tron2_cabinet_lora.py')
 DEFAULT_WORK = os.path.join(FV, 'work_dirs/tron2_buttons_v2')

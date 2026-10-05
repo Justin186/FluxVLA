@@ -30,7 +30,10 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-FV = '/home/lab/tron_ws/FluxVLA'
+# 仓库根目录：默认取本脚本所在目录的上一级，任何机器都能跑；可用 FLUXVLA_ROOT 覆盖
+FV = os.environ.get(
+    'FLUXVLA_ROOT',
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ROOT = os.path.join(FV, 'datasets/RealRobot_Tron2_lerobot')
 
 

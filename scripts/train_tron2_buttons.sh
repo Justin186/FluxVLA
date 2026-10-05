@@ -38,8 +38,11 @@ set -euo pipefail
 
 BASE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 FV="$BASE"
-PY=${FLUXVLA_PY:-/home/lab/miniconda3/envs/fluxvla/bin/python3}
-TORCHRUN=${FLUXVLA_TORCHRUN:-/home/lab/miniconda3/envs/fluxvla/bin/torchrun}
+# 机器相关路径一律自动探测，换机器不用改脚本；需要指定时用 FLUXVLA_PY /
+# FLUXVLA_TORCHRUN 覆盖。顺序：环境变量 -> 当前 python3 同目录 -> PATH
+PY=${FLUXVLA_PY:-$(command -v python3 2>/dev/null || echo /usr/bin/python3)}
+TORCHRUN=${FLUXVLA_TORCHRUN:-$(dirname "$PY")/torchrun}
+[ -x "$TORCHRUN" ] || TORCHRUN=$(command -v torchrun 2>/dev/null || true)
 
 DATA="$FV/datasets/RealRobot_Tron2_lerobot"
 STATS="$DATA/tron2_stats_armsymmetric.json"
@@ -58,8 +61,10 @@ SKIP_STATS=${SKIP_STATS:-0}
 
 fail() { echo "[FAIL] $*" >&2; exit 1; }
 
-[ -x "$PY" ] || fail "找不到 python: $PY"
-[ -x "$TORCHRUN" ] || fail "找不到 torchrun: $TORCHRUN"
+[ -x "$PY" ] || fail \
+  "找不到 python（探测结果 '${PY}'）。请先 'conda activate fluxvla'，或设 FLUXVLA_PY 指向它"
+[ -x "$TORCHRUN" ] || fail \
+  "找不到 torchrun（探测结果 '${TORCHRUN}'）。请先 'conda activate fluxvla'，或设 FLUXVLA_TORCHRUN 指向它"
 [ -f "$CONFIG" ] || fail "找不到训练 config: $CONFIG"
 [ $((MAX_STEPS % SAVE_ITER)) -eq 0 ] || \
   fail "MAX_STEPS($MAX_STEPS) 不能被 SAVE_ITER($SAVE_ITER) 整除，最后一步不落盘（guide §7.6）"

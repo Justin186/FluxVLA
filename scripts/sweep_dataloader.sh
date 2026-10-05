@@ -3,10 +3,11 @@
 # 固定 per_device_batch_size=2 / accum=4，逐个测 worker 数与视频解码后端
 
 set -u
-cd /home/lab/tron_ws/FluxVLA
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CFG=configs/pi05/pi05_paligemma_tron2_cabinet_lora.py
 WD=work_dirs/sweep2
-PY=/opt/miniconda3/envs/fluxvla/bin/torchrun
+# 这个变量装的是 torchrun（名字沿用历史），自动探测，可用 FLUXVLA_TORCHRUN 覆盖
+PY=${FLUXVLA_TORCHRUN:-$(dirname "$(command -v python3 2>/dev/null || echo /usr/bin/python3)")/torchrun}
 
 rm -rf $WD
 mkdir -p $WD

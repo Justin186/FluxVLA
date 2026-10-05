@@ -3,10 +3,11 @@
 # 每组跑 12 步，记录 s/it 与是否 OOM。共用同一个 work_dir 以复用统计缓存。
 
 set -u
-cd /home/lab/tron_ws/FluxVLA
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CFG=configs/pi05/pi05_paligemma_tron2_cabinet_lora.py
 WD=work_dirs/sweep
-PY=/opt/miniconda3/envs/fluxvla/bin/torchrun
+# 这个变量装的是 torchrun（名字沿用历史），自动探测，可用 FLUXVLA_TORCHRUN 覆盖
+PY=${FLUXVLA_TORCHRUN:-$(dirname "$(command -v python3 2>/dev/null || echo /usr/bin/python3)")/torchrun}
 
 rm -rf $WD
 mkdir -p $WD
