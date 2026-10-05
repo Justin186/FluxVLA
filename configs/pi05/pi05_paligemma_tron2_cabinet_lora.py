@@ -311,8 +311,16 @@ inference = dict(
     type='Tron2InferenceRunner',
     keep_params_fp32=True,
     mixed_precision_dtype='bf16',
+    # ⚠️ 必须与训练数据集 meta/tasks.parquet 里的任务文本逐字一致：
+    #   lerobot_2026-10-02_22-55-58 -> 'Press the red button'
+    #   lerobot_2026-10-02_23-24-38 -> 'Press the black button'
+    #   lerobot_2026-10-02_23-53-41 -> 'Press the green button'
+    # PreparePromptWithState 的 lowercase_task_description 默认 False，
+    # 只做 strip()/_→空格/去换行，所以大小写与措辞一个字都不能改。
     task_descriptions={
-        '1': 'complete the task',
+        '1': 'Press the red button',
+        '2': 'Press the black button',
+        '3': 'Press the green button',
     },
     seed=7,
     dataset=dict(

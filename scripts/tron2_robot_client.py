@@ -60,6 +60,15 @@ SHIM_SLOT = {
 # ("hw 0-100, we /100 -> 0-1") and its get_latest_gripper_state(), and the live
 # reading (right_opening 2 -> 0.02, i.e. almost closed).
 GRIPPER_SCALE = 100.0
+
+# 数据集里三个按钮的末端位置（米）：取各集「伸得最远那一帧」的
+# observation.ee_pose_right 均值。按钮中心距约 56~60 mm，有效半径约 10~15 mm。
+# 用它就能在日志里直接看出「这次按压落在哪个按钮、差多少毫米」。
+BUTTON_XYZ = {
+    'red': np.array([0.6577, -0.2205, -0.3246]),
+    'black': np.array([0.6616, -0.2180, -0.2683]),
+    'green': np.array([0.6840, -0.1906, -0.2121]),
+}
 READ_GRIPPER = True
 GRIPPER_FALLBACK = 0.0
 HEAD_PIN = 0.0  # only used for the 18-dim `states` vector
@@ -111,7 +120,7 @@ JOINT_NAMES = ['abad_L', 'hip_L', 'yaw_L', 'knee_L', 'wy_L', 'wp_L', 'wr_L',
 # reports right now.  Bounding the increment rather than the offset from the
 # start pose is what lets a chunk actually travel; an offset bound pins every
 # step of the chunk inside one small box around the start and the arm crawls.
-DEFAULT_MAX_DELTA = 0.10          # rad, ~5.7 deg per servo step
+DEFAULT_MAX_DELTA = 0.10          # rad, ~5.7 deg per servo step吗
 DEFAULT_HEAD_MAX_DELTA = 0.05     # rad; the head is cosmetic and slow
 
 # Envelope: how far one chunk may end up from the pose it started at.  This is
@@ -183,6 +192,72 @@ def plan_commands(actions: np.ndarray, states18: np.ndarray,
     info['rate_clamped'] = int(np.count_nonzero(~np.isclose(before, cmd)))
 
     return cmd.astype(np.float32), info
+
+
+def clamp_step_delta(cmd: np.ndarray, cur: np.ndarray,
+                     max_delta: float = DEFAULT_MAX_DELTA) -> tuple:
+    """Re-apply the per-servo-step rate limit to a finished command block.
+
+    Same loop as the tail of :func:`plan_commands`, factored out because it has
+    to run again *after* blending: mixing two individually legal plans can
+    still produce a step-to-step jump that neither plan had, and that jump
+    would go straight to the motors.
+    """
+    delta = np.full(16, max_delta)
+    delta[14:16] = DEFAULT_HEAD_MAX_DELTA
+    out = np.asarray(cmd, dtype=np.float64).copy()
+    before = out.copy()
+    prev = np.asarray(cur, dtype=np.float64)
+    for t in range(out.shape[0]):
+        out[t] = np.clip(out[t], prev - delta, prev + delta)
+        prev = out[t]
+    return out.astype(np.float32), int(np.count_nonzero(~np.isclose(before, out)))
+
+
+def blend_chunks(new_plan: np.ndarray, prev_plan: np.ndarray, prev_exec: int,
+                 decay: int | None = None, seam_weight: float = 1.0) -> tuple:
+    """Temporal ensembling at the handover ("提前重规划").
+
+    Consecutive chunks overlap by ``n_action_steps - exec_steps`` steps: when
+    only ``exec_steps`` of a 50-step chunk are executed, the previous chunk
+    still holds a prediction for exactly the window the new chunk covers.
+
+    Weighting that leftover prediction in near the seam keeps the motion
+    continuous with what the arm is already doing, and letting the new plan
+    take over further out lets the fresher observation win.  Averaging the two
+    also cuts the per-inference noise (measured 0.0106 rad rms) by ~1/sqrt(2).
+
+    Weights use the same 'exp' schedule as
+    ``fluxvla.engines.utils.rtc_guidance.compute_prefix_weights`` --
+    ``exp(-3 * i / (decay - 1))`` -- so the client-side blend matches the
+    formula the server-side RTC path would use.  (That helper early-returns
+    all-zeros for ``prefix_len <= 0``, and here nothing is locked, so the decay
+    region is reproduced directly.)
+
+    Returns ``(blended_plan, info)``.
+    """
+    tail = np.asarray(prev_plan, dtype=np.float64)[int(prev_exec):]
+    new_plan = np.asarray(new_plan, dtype=np.float64)
+    n = min(len(tail), len(new_plan))
+    info = {'overlap': int(n), 'decay': 0, 'max_weight': 0.0}
+    if n <= 0:
+        return new_plan.astype(np.float32), info
+
+    length = int(decay) if decay else n
+    length = max(2, min(length, n))
+    frac = np.arange(length, dtype=np.float64) / (length - 1)
+    # seam_weight=1 trusts the previous chunk completely at the seam, which is
+    # what RTC does for steps that are already being executed.  Here nothing is
+    # committed yet, and the previous chunk's tail was predicted from an
+    # observation exec_steps*dt earlier, so a weight below 1 keeps the fresher
+    # plan contributing from the first step onward.
+    w = float(seam_weight) * np.exp(-3.0 * frac)
+
+    out = new_plan.copy()
+    blk = w[:, None] * tail[:length] + (1.0 - w[:, None]) * new_plan[:length]
+    out[:length] = blk
+    info.update(decay=length, max_weight=float(w[0]))
+    return out.astype(np.float32), info
 
 
 def ws_request(ws, accid: str, title: str, data: dict, timeout: float = 6.0):
@@ -310,6 +385,80 @@ def read_robot_state(ws_url: str, accid: str, timeout: float = 6.0):
         ws.close()
 
 
+class RobotQueryLink:
+    """Reusable WebSocket for robot state queries.
+
+    Measured on this link: a query costs ~1 ms once the connection is up, but
+    ~330 ms when the WebSocket has to be opened first.  The run loop used to
+    open up to three fresh connections per chunk (observation, end-effector
+    diagnostic, the pre-stream pose anchor) -- roughly a second of the pause
+    between chunks, spent on queries that themselves take milliseconds.
+
+    The servoj socket stays separate on purpose: it streams at 500 Hz and has to
+    be drained continuously, so it must not be shared with a query socket.  A
+    lock makes this link safe to use from the end-effector watch thread too.
+    """
+
+    def __init__(self, ws_url: str, accid: str, timeout: float = 6.0):
+        self.ws_url = ws_url
+        self.accid = accid
+        self.timeout = timeout
+        self._ws = None
+        self._lock = threading.Lock()
+
+    def _connect(self):
+        import websocket
+        self._ws = websocket.create_connection(self.ws_url,
+                                               timeout=self.timeout)
+
+    def request(self, title: str):
+        with self._lock:
+            try:
+                if self._ws is None:
+                    self._connect()
+                return _request(self._ws, self.accid, title, self.timeout)
+            except Exception:                               # noqa: BLE001
+                # The link can drop when the robot restarts or the network
+                # blips; reconnect once and retry rather than failing the loop.
+                try:
+                    if self._ws is not None:
+                        self._ws.close()
+                except Exception:                           # noqa: BLE001
+                    pass
+                self._ws = None
+                self._connect()
+                return _request(self._ws, self.accid, title, self.timeout)
+
+    def joints_gripper(self):
+        """``(js16, grip2)`` -- same shape and fallback as read_robot_state."""
+        js16 = self.request('request_get_joint_state')['q']
+        grip = [GRIPPER_FALLBACK, GRIPPER_FALLBACK]
+        if READ_GRIPPER:
+            try:
+                g = self.request('request_get_limx_2fclaw_state')
+                grip = [float(g['left_opening']) / GRIPPER_SCALE,
+                        float(g['right_opening']) / GRIPPER_SCALE]
+            except Exception as exc:                        # noqa: BLE001
+                print('  [warn] 夹爪状态读取失败，回退 %.1f: %s'
+                      % (GRIPPER_FALLBACK, exc))
+        return (np.asarray(js16, dtype=np.float32),
+                np.asarray(grip, dtype=np.float32))
+
+    def ee_pose(self):
+        r = self.request('request_get_move_pose')
+        return (np.asarray(r['right_position'], dtype=np.float64),
+                np.asarray(r['left_position'], dtype=np.float64))
+
+    def close(self):
+        with self._lock:
+            if self._ws is not None:
+                try:
+                    self._ws.close()
+                except Exception:                           # noqa: BLE001
+                    pass
+                self._ws = None
+
+
 def _request(ws, accid: str, title: str, timeout: float):
     guid = uuid.uuid4().hex
     ws.send(json.dumps({
@@ -333,6 +482,24 @@ def _request(ws, accid: str, title: str, timeout: float):
             raise RuntimeError('%s -> %s' % (title, data.get('result')))
         return data
     raise RuntimeError('%s timed out' % title)
+
+
+def read_ee_pose(ws_url: str, accid: str, timeout: float = 6.0):
+    """读双臂末端位姿（米）。SDK 3.6.6：``request_get_move_pose``。
+
+    返回 ``(right_xyz, left_xyz)``。这是机器人控制器自己算出来的末端位置，
+    比任何从关节拟合的 FK 都可靠 —— 关节空间有 7 自由度冗余，同样的关节
+    位姿可以对应差几十毫米的末端位置，所以判断"按压点落在哪"必须以这个为准。
+    """
+    import websocket
+
+    ws = websocket.create_connection(ws_url, timeout=timeout)
+    try:
+        r = _request(ws, accid, 'request_get_move_pose', timeout)
+    finally:
+        ws.close()
+    return (np.asarray(r['right_position'], dtype=np.float64),
+            np.asarray(r['left_position'], dtype=np.float64))
 
 
 def build_observation(js16: np.ndarray, grip2: np.ndarray):
@@ -365,8 +532,8 @@ def build_observation(js16: np.ndarray, grip2: np.ndarray):
 # --------------------------------------------------------------------------- #
 # inference
 # --------------------------------------------------------------------------- #
-def predict(obs: dict, zmq_addr: str, unnorm_key: str, seed: int,
-            episode_id: str = 'readonly-loop', reset: bool = True):
+def connect_zmq(zmq_addr: str):
+    """建一条长连接（REQ 可以顺序发多条请求），避免每次采样都重连。"""
     import zmq
     from fluxvla.engines.runners.serving.serializers import MsgSerializer
 
@@ -375,27 +542,64 @@ def predict(obs: dict, zmq_addr: str, unnorm_key: str, seed: int,
     sock.setsockopt(zmq.RCVTIMEO, 600_000)
     sock.setsockopt(zmq.LINGER, 0)
     sock.connect(zmq_addr)
-    try:
-        sock.send(MsgSerializer.to_bytes({
-            'endpoint': 'predict_action',
-            'data': {
-                'observation': obs,
-                'unnorm_key': unnorm_key,
-                'episode_id': episode_id,
-                'seed': seed,
-                'reset': reset,
-                'request_id': uuid.uuid4().hex,
-            },
-        }))
-        resp = MsgSerializer.from_bytes(sock.recv())
-    finally:
-        sock.close()
-        ctx.term()
+    return ctx, sock, MsgSerializer
 
-    if not resp.get('ok', False):
-        raise RuntimeError('server error: %s' % resp.get('error'))
-    return (np.asarray(resp['actions'], dtype=np.float32),
-            float(resp.get('inference_time_s', 0.0)))
+
+def close_zmq(session) -> None:
+    if session is None:
+        return
+    try:
+        session[1].close()
+        session[0].term()
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def predict(obs: dict, zmq_addr: str, unnorm_key: str, seed: int,
+            episode_id: str = 'readonly-loop', reset: bool = True,
+            samples: int = 1, session=None):
+    """单次或多次采样。
+
+    ``samples > 1`` 时用 ``seed, seed+1, ...`` 各采一次再取平均。
+    实测模型的误差以【随机】为主（逐关节有符号偏差 <= 0.009 rad，
+    而 RMS 最差 0.049 rad），所以多次平均能直接降误差：
+    N=4 约减半，N=8 约降到 1/3。
+
+    注意：seed 变化会让服务端判定 is_new_episode=True，但该标志只被
+    dreamzero 系列使用（我们用的是 PI05FlowMatchingRTCInference），
+    对当前策略是 no-op。
+
+    返回 ``(actions, 服务端耗时合计, 逐次采样栈 (N, T, A))``。
+    """
+    own = session is None
+    if own:
+        session = connect_zmq(zmq_addr)
+    ctx, sock, serializer = session
+    outs, times = [], []
+    try:
+        for j in range(max(1, int(samples))):
+            sock.send(serializer.to_bytes({
+                'endpoint': 'predict_action',
+                'data': {
+                    'observation': obs,
+                    'unnorm_key': unnorm_key,
+                    'episode_id': episode_id,
+                    'seed': int(seed) + j,
+                    'reset': reset,
+                    'request_id': uuid.uuid4().hex,
+                },
+            }))
+            resp = serializer.from_bytes(sock.recv())
+            if not resp.get('ok', False):
+                raise RuntimeError('server error: %s' % resp.get('error'))
+            outs.append(np.asarray(resp['actions'], dtype=np.float32))
+            times.append(float(resp.get('inference_time_s', 0.0)))
+    finally:
+        if own:
+            close_zmq(session)
+
+    stack = np.stack(outs)                       # (N, T, A)
+    return (stack.mean(0).astype(np.float32), float(sum(times)), stack)
 
 
 def trained_tasks():
@@ -869,6 +1073,153 @@ def report_joint_watch(samples: dict, t_takeover, window: float = 0.4):
                      TAU[k, jj]))
 
 
+def start_ee_watch(ws_url: str, accid: str, timeout: float = 6.0,
+                   period: float = 0.02, link=None):
+    """Poll the two end-effector positions on a dedicated connection.
+
+    ``request_get_move_pose`` is the controller's own answer for where the
+    hand is, and it is the only thing that can say whether a press landed on
+    a button: the arm has 7-DoF joints with redundancy, so the same joint
+    vector can put the tip tens of millimetres apart.  Every previously
+    recorded trace only sampled joint space, which is why "did it hit the
+    button" was never answerable from the logs.
+
+    Returns ``(stop_and_join, samples)`` with samples
+    ``{'t', 'right', 'left'}``.
+    """
+    import threading
+
+    import websocket
+
+    samples = {'t': [], 'right': [], 'left': []}
+    stop = threading.Event()
+
+    def run():
+        sock = None
+        if link is None:
+            try:
+                sock = websocket.create_connection(ws_url, timeout=timeout)
+            except Exception as exc:                        # noqa: BLE001
+                print('  [warn] 末端位姿监控连接失败: %s' % exc)
+                return
+        try:
+            t0 = time.perf_counter()
+            while not stop.is_set():
+                try:
+                    if link is not None:
+                        # 复用查询连接：新建一条要 ~330 ms，而过它只需 ~1 ms
+                        d = link.request('request_get_move_pose')
+                    else:
+                        d = _request(sock, accid, 'request_get_move_pose',
+                                     timeout)
+                except Exception:                           # noqa: BLE001
+                    break
+                samples['t'].append(time.perf_counter() - t0)
+                samples['right'].append(
+                    np.asarray(d['right_position'], dtype=np.float64))
+                samples['left'].append(
+                    np.asarray(d.get('left_position', [np.nan] * 3),
+                               dtype=np.float64))
+                time.sleep(period)
+        finally:
+            if sock is not None:
+                sock.close()
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+
+    def stop_and_join():
+        stop.set()
+        th.join(timeout=3.0)
+
+    return stop_and_join, samples
+
+
+# Effective button radius.  BUTTON_XYZ is the mean of each subset's most
+# extended ee_pose_right, spaced 56-60 mm apart, and only the middle 10-15 mm
+# of that gap is reliably pressable.
+PRESS_RADIUS_OK = 0.015
+PRESS_RADIUS_EDGE = 0.025
+
+
+def report_press_trace(samples: dict, task: str):
+    """Where did the hand actually get to, relative to the trained press pose?
+
+    Returns a record for :func:`report_press_summary`, or None if the trace is
+    empty or the task does not name one of the known buttons.
+    """
+    if not samples['t']:
+        print('  [按压记录] 没采到末端位姿')
+        return None
+    T = np.asarray(samples['t'])
+    P = np.asarray(samples['right'])
+    key = None
+    for k in BUTTON_XYZ:
+        if k in task.lower():
+            key = k
+    if key is None:
+        print('  [按压记录] 任务 %r 不对应 BUTTON_XYZ 里的按钮，跳过对比' % task)
+        return None
+    target = BUTTON_XYZ[key]
+    d = np.linalg.norm(P - target, axis=1)
+    i = int(np.argmin(d))
+    print('  [按压记录] %d 次采样 / %.2f s (%.0f Hz)  目标按钮 = %s'
+          % (len(T), T[-1], len(T) / max(T[-1], 1e-9), key))
+    print('     最近接近 : %.1f mm  (t = %+.2f s)' % (d[i] * 1000, T[i]))
+    print('     该点偏移 : x %+7.1f   y %+7.1f   z %+7.1f  mm'
+          % tuple((P[i] - target) * 1000))
+    zmm = float((P[i] - target)[2]) * 1000
+    print('     只有 z 是精度指标（按钮排列方向，有效半径 10~15 mm）: '
+          '%+.1f mm -> %s'
+          % (zmm, '达标' if abs(zmm) <= PRESS_RADIUS_OK * 1000
+             else ('压边缘' if abs(zmm) <= PRESS_RADIUS_EDGE * 1000
+                   else '偏出按钮')))
+    print('     x/y 是机位差异，不是误差（数据集跨多个机位录制，'
+          '起始位姿一变它们整体平移）')
+    return dict(t=T, right=P, idx=i, dist=d, target=target,
+                offset=P[i] - target)
+
+
+def report_press_summary(records: list, task: str):
+    """Summarise the press offsets, reading **z** as the accuracy number.
+
+    The three subsets were recorded with the base at several positions, so an
+    episode's start pose -- and with it the press pose -- moves in x and y.
+    Measured over the recordings: the press y offset is predicted by the start
+    y offset with correlation 0.78-0.88, while the press z offset correlates
+    ~0 with the start and stays inside 3-5 mm across all 1513 episodes.  So
+    x/y are where the machine happened to stand, z is how well the button was
+    found, and judging a press by its 3D distance to the dataset-mean button
+    centre charges it for standing somewhere else.
+
+    z is the direction the three buttons are stacked in (56-68 mm apart),
+    i.e. the one that decides which button gets hit, so it is the only axis
+    worth comparing between runs.
+    """
+    off = np.asarray([r['offset'] for r in records])
+    z = off[:, 2] * 1000.0
+    print()
+    print('=' * 74)
+    print('按压精度汇总   任务 = %r   次数 = %d' % (task, len(off)))
+    print('=' * 74)
+    print('  z 偏移（按钮排列方向 = 决定按哪个按钮）:')
+    print('    均值 %+7.1f mm   标准差 ±%6.1f mm   范围 %+.1f ~ %+.1f mm'
+          % (z.mean(), z.std(), z.min(), z.max()))
+    print('    |z|<=15mm %d/%d   <=25mm %d/%d   超出 %d/%d'
+          % (int((np.abs(z) <= PRESS_RADIUS_OK * 1000).sum()), len(z),
+             int((np.abs(z) <= PRESS_RADIUS_EDGE * 1000).sum()), len(z),
+             int((np.abs(z) > PRESS_RADIUS_EDGE * 1000).sum()), len(z)))
+    print('    判据：按钮有效半径 10~15 mm；演示数据自身在 z 上做到了 3~5 mm，')
+    print('          所以 |均值| 和 标准差 都要 <= 5 mm 才算追平演示')
+    print('  x/y 偏移（参照用，不是误差）:')
+    print('    均值 x %+7.1f   y %+7.1f mm     标准差 ±%.1f / ±%.1f mm'
+          % (off[:, 0].mean() * 1000, off[:, 1].mean() * 1000,
+             off[:, 0].std() * 1000, off[:, 1].std() * 1000))
+    print('    这两列大不等于按偏了：数据集跨多个机位，换机位就整体平移。')
+    if len(off) < 5:
+        print('  !! 只跑了 %d 次，均值/标准差不稳；建议 >=5 次' % len(off))
+
+
 def servo_summary(stats: dict) -> str:
     """Describe what came back on a servo socket, faults included.
 
@@ -909,6 +1260,27 @@ def interpolate_plan(plan: np.ndarray, dt: float, hz: int) -> np.ndarray:
 # the arms hanging limp during start-up the gap is at its largest, which is why
 # the thump happens then.
 ENGAGE_SECONDS = 0.4
+
+
+def engage_time_for(gap: float, v_max: float, t_min: float,
+                    t_max: float) -> float:
+    """Ramp length that eases ``gap`` without exceeding ``v_max``.
+
+    A raised-cosine ramp of length T covers ``gap`` with peak speed
+    ``pi*gap/(2T)``, so ``T = pi*gap/(2*v_max)`` bounds the reference speed.
+
+    Clamped to ``[t_min, t_max]``:
+      * ``t_min`` keeps a tiny gap from becoming a step -- the servo's kp
+        reaches 420, so even a small discontinuity is a torque spike.
+      * ``t_max`` is the old fixed value, kept as the ceiling.  Only the first
+        chunk after ``--goto-initial`` (or after loading the model, when the
+        arms have been hanging limp) actually has a large gap; every later one
+        does not, and used to pay the full 0.4 s for nothing.
+    """
+    if gap <= 0.0:
+        return float(t_min)
+    t = float(np.pi) * float(gap) / (2.0 * max(float(v_max), 1e-6))
+    return float(min(max(t, t_min), t_max))
 
 
 def engage_ramp(target: np.ndarray, fresh: np.ndarray, hz: int,
@@ -1153,11 +1525,34 @@ def main() -> int:
                     help='inference server address')
     ap.add_argument('--unnorm-key', default='private')
     ap.add_argument('--seed', type=int, default=7)
+    ap.add_argument('--samples', type=int, default=1,
+                    help='每个 chunk 采样几次再平均（默认 1）。flow matching 的'
+                         '误差以随机为主，N=4 约把模型误差减半，N=8 约降到 1/3；'
+                         '代价是推理耗时 ×N（预算 1067 ms，N=4~8 仍富余）')
     ap.add_argument('--runs', type=int, default=3, help='number of iterations')
     ap.add_argument('--interval', type=float, default=1.0,
                     help='seconds between iterations')
     ap.add_argument('--save-dir', default=None,
                     help='optional directory to dump frames + actions as npz')
+    ap.add_argument('--log-press', default=None, metavar='PREFIX',
+                    help='执行期间在独立连接上以 ~50 Hz 采样双臂末端位姿，'
+                         '存为 <PREFIX>_chunkNNN.npz，并打印这次按压在 z'
+                         '（按钮排列方向，决定按哪个按钮）上偏了几毫米。'
+                         'x/y 会随机位整体平移，不作为误差。仅 --execute 有效')
+    ap.add_argument('--exec-steps', type=int, default=50, metavar='K',
+                    help='每个 chunk 只执行前 K 步就重规划（默认 50 = 走完整段，'
+                         '与旧行为完全一致）。K<50 时相邻两段重叠 50-K 步，'
+                         '这是"提前重规划"的前提')
+    ap.add_argument('--rtc-blend', choices=['none', 'exp'], default='none',
+                    help='接缝处的时序集成：把新 chunk 与上一段【未执行完的尾部】'
+                         '按指数权重混合（exp(-3i/decay)），近处信旧段保证连续、'
+                         '远处信新段用上新观测。需要 --exec-steps < 50，否则没有重叠')
+    ap.add_argument('--rtc-decay', type=int, default=None, metavar='N',
+                    help='混合的过渡长度（步）。默认 = 重叠长度 (50-K)')
+    ap.add_argument('--rtc-seam-weight', type=float, default=1.0, metavar='W',
+                    help='接缝处对上一段的权重，默认 1.0（完全信旧段）。'
+                         '上一段尾部是 exec_steps*dt 秒前的预测，'
+                         'W<1 让更新的计划从第一步就参与。建议试 0.5')
     ap.add_argument('--task', default='Press the red button',
                     help='训练过的任务文本，必须与数据集里的完全一致；'
                          '5 个任务是共用一个模型的唯一区分手段')
@@ -1176,15 +1571,31 @@ def main() -> int:
                     help='一个动作步的时间(s)，默认 1/30 = %.5f' % DEFAULT_CHUNK_DT)
     ap.add_argument('--engage-time', type=float, default=ENGAGE_SECONDS,
                     help='从"发指令前实测位姿"平滑过渡到计划首步的时间(s)，'
-                         '默认 %.1f。用于消除进入伺服时的力矩台阶'
+                         '默认 %.1f。用于消除进入伺服时的力矩台阶。'
+                         '开启 --engage-adaptive 时它是【上限】而非固定值'
                          % ENGAGE_SECONDS)
+    ap.add_argument('--engage-adaptive', action='store_true', default=True,
+                    help='默认开：按"推理后偏差 gap"算斜坡长度 '
+                         'T = pi*gap/(2*v)，夹在 [--engage-min, --engage-time]。'
+                         'gap 很小时斜坡自动缩到下限，不再白等 0.4 秒')
+    ap.add_argument('--no-engage-adaptive', dest='engage_adaptive',
+                    action='store_false',
+                    help='关掉自适应，斜坡固定为 --engage-time')
+    ap.add_argument('--engage-min', type=float, default=0.05, metavar='S',
+                    help='自适应斜坡的下限(s)，默认 0.05（防止小 gap 变成台阶）')
+    ap.add_argument('--engage-vel', type=float, default=1.0, metavar='RAD_S',
+                    help='过渡时的峰值参考速度上限(rad/s)，默认 1.0。'
+                         '实测计划自身步速约 0.6~1.35 rad/s，取 1.0 保守')
     ap.add_argument('--execute', action='store_true',
                     help='⚠️ 真的把计划下发给机器人（默认关闭：只预览不发送）')
     ap.add_argument('--yes', action='store_true',
                     help='跳过 --execute / --goto-initial 的交互式确认')
     ap.add_argument('--goto-initial', action='store_true',
                     help='⚠️ 平滑移动到 --task 对应数据集片段的起始位姿'
-                         '（需 --yes 或交互确认）')
+                         '（需 --yes 或交互确认）。到位后会【继续】跑 --runs '
+                         '的观测/推理/执行循环；只想定位就加 --goto-stop')
+    ap.add_argument('--goto-stop', action='store_true',
+                    help='--goto-initial 到位后立即退出（旧行为）。默认不退出')
     ap.add_argument('--goto-seconds', type=float, default=10.0,
                     help='--goto-initial 的运动时长(s)；仅当 --goto-vel 为 0 '
                          '时用作回退值，默认 10')
@@ -1398,7 +1809,15 @@ def main() -> int:
         report_joint_watch(watch, t_takeover)
         print('  执行后 /joint_states(16): %s'
               % np.array2string(after, precision=4))
-        return 0
+        if args.goto_stop:
+            print()
+            print('  [--goto-stop] 定位完成，按要求退出（未进入推理循环）。')
+            return 0
+        print()
+        print('  [goto-initial 完成] 已到位，继续进入观测/推理循环 ...')
+        print('  （原先这里直接 return 0，导致 --goto-initial 之后什么都不做；'
+              '要旧行为请加 --goto-stop）')
+        print()
 
     print('=' * 74)
     if args.execute:
@@ -1430,6 +1849,14 @@ def main() -> int:
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
 
+    # 长连接复用：一次连接跑完全部 chunk 的全部采样，避免每采样都重连
+    zmq_session = connect_zmq(args.zmq)
+    # 机器人状态查询走一条【复用】连接：新建 WebSocket 要 ~330 ms，查询本身只要 ~1 ms
+    robot_link = RobotQueryLink(args.ws, args.accid)
+    print('  ZMQ 长连接已建立；每 chunk 采样 %d 次%s'
+          % (max(1, args.samples),
+             '' if args.samples <= 1 else '（取平均，降随机误差）'))
+
     ws_servo = None
     if args.execute:
         print('!! 执行模式：将以 servoj 向机器人下发策略输出。')
@@ -1452,11 +1879,21 @@ def main() -> int:
     print()
 
     np.set_printoptions(precision=4, suppress=True, linewidth=200)
+    press_records = []          # --log-press: 每次执行的末端位姿轨迹
+    prev_plan = None            # --rtc-blend: 上一段安全层后的完整计划（未截断）
+    prev_exec = 0               # 上一段实际执行了多少步
+    t_last_stream_end = None    # 上一段 servoj 流结束的时刻（用于量化段间停顿）
     for i in range(1, args.runs + 1):
         t0 = time.perf_counter()
         frames = fetch_frames(args.shim)
-        js16, grip2 = read_robot_state(args.ws, args.accid)
+        js16, grip2 = robot_link.joints_gripper()
         qpos, states = build_observation(js16, grip2)
+        ee_r = None
+        try:
+            ee_r, _ee_l = robot_link.ee_pose()
+        except Exception as exc:                               # noqa: BLE001
+            if i == 1:
+                print('  [warn] 末端位姿读取失败（不影响推理）: %s' % exc)
         t_obs = time.perf_counter() - t0
 
         obs = dict(frames)
@@ -1465,21 +1902,40 @@ def main() -> int:
         obs['task_description'] = task
 
         t1 = time.perf_counter()
-        actions, infer_s = predict(obs, args.zmq, args.unnorm_key, args.seed)
+        actions, infer_s, samples_arr = predict(
+            obs, args.zmq, args.unnorm_key, args.seed,
+            samples=args.samples, session=zmq_session)
         t_round = time.perf_counter() - t1
+        n_s = len(samples_arr)
 
         print('--- 第 %d 次 ---' % i)
-        print('  观测耗时 %.0f ms  推理往返 %.0f ms (服务端 %.1f ms)'
-              % (t_obs * 1000, t_round * 1000, infer_s * 1000))
+        print('  观测耗时 %.0f ms  推理往返 %.0f ms (服务端 %.1f ms%s)'
+              % (t_obs * 1000, t_round * 1000, infer_s * 1000,
+                 '' if n_s <= 1 else ' / %d 次采样' % n_s))
         print('  图像        : %s' % {
             k: tuple(v.shape) + (int(v.mean()),) for k, v in frames.items()})
         print('  /joint_states(16): %s' % np.array2string(js16, precision=4))
+        if ee_r is not None:
+            _d = {k: float(np.linalg.norm(ee_r - v))
+                  for k, v in BUTTON_XYZ.items()}
+            print('  右臂末端(真机上报) xyz: %s'
+                  % np.array2string(ee_r, precision=4))
+            print('    离各按钮(mm): %s   最近 = %s'
+                  % ({k: round(v * 1000, 1) for k, v in _d.items()},
+                     min(_d, key=_d.get)))
         print('  夹爪 hw/标定后   : [%.0f, %.0f] -> [%.4f, %.4f]'
               % (grip2[0] * GRIPPER_SCALE, grip2[1] * GRIPPER_SCALE,
                  grip2[0], grip2[1]))
         print('  qpos(16) -> 服务端: %s' % np.array2string(qpos, precision=4))
         print('  states(18) 服务端 : %s' % np.array2string(states, precision=4))
         print('  动作 shape=%s denormalized' % (actions.shape,))
+        if n_s > 1:
+            sd_r = float(samples_arr.std(0)[:, 7:14].mean())
+            sd_a = float(samples_arr.std(0).mean())
+            off = float(np.abs(samples_arr - actions[None]).max())
+            print('  [多采样] %d 次取平均；逐点标准差：右臂 %.4f / 全局 %.4f rad，'
+                  '相对平均值的最大偏离 %.4f rad'
+                  % (n_s, sd_r, sd_a, off))
         print('  第一步(18)  : %s' % np.array2string(actions[0], precision=4))
         print('  末步(18)    : %s' % np.array2string(actions[-1], precision=4))
         print('  右臂相对当前位姿 max|Δ|: %.4f'
@@ -1498,6 +1954,27 @@ def main() -> int:
         plan, info = plan_commands(actions, states, max_delta=args.max_delta,
                                    max_reach=args.max_reach)
         cur16 = np.concatenate([states[0:7], states[7:14], states[14:16]])
+
+        # ---- 提前重规划：与上一段【未执行完的尾部】做时序集成 ----
+        if args.rtc_blend != 'none':
+            if prev_plan is None:
+                print('  [RTC] 第一次执行，无上一段可混合；本段按原计划走')
+            elif args.exec_steps >= plan.shape[0]:
+                print('  [RTC] --exec-steps = %d >= chunk %d 步，相邻段无重叠，'
+                      '跳过混合' % (args.exec_steps, plan.shape[0]))
+            else:
+                plan, binfo = blend_chunks(plan, prev_plan, prev_exec,
+                                           args.rtc_decay,
+                                           args.rtc_seam_weight)
+                plan, n_re = clamp_step_delta(plan, cur16,
+                                              max_delta=args.max_delta)
+                print('  [RTC] 与上一段尾部混合：重叠 %d 步，过渡 %d 步，'
+                      '接缝权重 %.3f'
+                      % (binfo['overlap'], binfo['decay'], binfo['max_weight']))
+                print('        混合后重过步间限幅：%d 个动作值被 --max-delta 限住'
+                      % n_re)
+        exec_steps = int(np.clip(args.exec_steps, 2, plan.shape[0]))
+        plan_exec = plan[:exec_steps]
         raw = np.concatenate([actions[:, 0:7], actions[:, 7:14],
                               actions[:, 14:16]], axis=1)
         tag = '执行' if args.execute else '预览不发送'
@@ -1513,10 +1990,21 @@ def main() -> int:
         print('     相对当前位姿 max|Δ|: 原始 %.4f -> 钳制后 %.4f'
               % (float(np.abs(raw - cur16).max()),
                  float(np.abs(plan - cur16).max())))
-        print('     计划末端相对起点 max|Δ|: %.4f rad'
-              % float(np.abs(plan[-1] - cur16).max()))
+        print('     计划末端相对起点 max|Δ|: %.4f rad  (完整 %d 步)'
+              % (float(np.abs(plan[-1] - cur16).max()), plan.shape[0]))
+        if exec_steps < plan.shape[0]:
+            print('     **本段只执行前 %d 步**（--exec-steps），执行末端相对起点 '
+                  'max|Δ|: %.4f rad'
+                  % (exec_steps, float(np.abs(plan_exec[-1] - cur16).max())))
         print('     servoj q(16) 第一步: %s'
               % np.array2string(plan[0], precision=4))
+        # 计划里的运动集中在哪几段：区分"策略自己在保持不动"和"客户端在等"
+        _d = np.abs(np.diff(plan, axis=0)).max(axis=1)
+        _nb = max(1, plan.shape[0] // 5)
+        print('     计划步间 max|Δ| 分段: %s   (整段峰值 %.4f rad)'
+              % (', '.join('%.3f' % _d[k:k + _nb].max()
+                           for k in range(0, max(1, plan.shape[0] - 1), _nb)),
+                 float(_d.max())))
         print('  [安全层·%s] 夹爪 (模型 0-1 × %.0f = 硬件 0-100):'
               % (tag, GRIPPER_SCALE))
         print('     request_set_limx_2fclaw_cmd right_opening = %.0f  '
@@ -1534,12 +2022,15 @@ def main() -> int:
             # (2.6 s on the first chunk) and the arms hang limp during start-up,
             # so they sag in that gap; starting from plan[0] would ask the motor
             # for the whole correction in one cycle.
-            fresh = np.asarray(read_robot_state(args.ws, args.accid)[0][:16],
+            fresh = np.asarray(robot_link.joints_gripper()[0][:16],
                                dtype=np.float64)
             gap = float(np.abs(fresh - cur16).max())
-            ref = interpolate_plan(plan, args.chunk_dt, SERVOJ_STREAM_HZ)
-            head = engage_ramp(ref[0], fresh, SERVOJ_STREAM_HZ,
-                               args.engage_time)
+            ref = interpolate_plan(plan_exec, args.chunk_dt, SERVOJ_STREAM_HZ)
+            ramp_s = args.engage_time
+            if args.engage_adaptive:
+                ramp_s = engage_time_for(gap, args.engage_vel, args.engage_min,
+                                         args.engage_time)
+            head = engage_ramp(ref[0], fresh, SERVOJ_STREAM_HZ, ramp_s)
             sub_steps = max(int(round(args.chunk_dt * SERVOJ_STREAM_HZ)), 1)
             grip = None
             if args.send_gripper:
@@ -1554,14 +2045,38 @@ def main() -> int:
                          grip.min() * GRIPPER_SCALE,
                          grip.max() * GRIPPER_SCALE))
             ref = np.vstack([head, ref])
-            print('  [执行] 位姿锚定: 推理后偏差 %.4f rad -> 用 %.2f s 平滑衔接'
-                  % (gap, args.engage_time))
+            print('  [执行] 位姿锚定: 推理后偏差 %.4f rad -> 用 %.2f s 平滑衔接%s'
+                  % (gap, ramp_s,
+                     '   (自适应，上限 %.2f s)' % args.engage_time
+                     if args.engage_adaptive else ''))
             print('  [执行] servoj %d 个 waypoint -> %d 条 @ %d Hz (%.2f s)'
-                  % (plan.shape[0], ref.shape[0], SERVOJ_STREAM_HZ,
+                  % (plan_exec.shape[0], ref.shape[0], SERVOJ_STREAM_HZ,
                      ref.shape[0] / SERVOJ_STREAM_HZ))
+            # 时间账：段间停顿到底花在哪
+            ramp_move = float(np.abs(head[-1] - head[0]).max())
+            print('     [时间账] 衔接斜坡 %.2f s 内实际位移 %.4f rad%s'
+                  % (ramp_s, ramp_move,
+                     '   <-- 位移≈0，这段等于原地停顿' if ramp_move < 0.01
+                     else ''))
+            if t_last_stream_end is not None:
+                print('     [时间账] 上一段流结束 -> 本段流开始 = %.2f s'
+                      '  (收尾 sleep 0.2 + 观测 %.2f + 推理 %.2f + interval %.1f)'
+                      % (time.perf_counter() - t_last_stream_end, t_obs,
+                         t_round, args.interval))
+            print('     [时间账] 本轮到开流为止已用 %.2f s'
+                  % (time.perf_counter() - t0))
+            # --log-press: 用独立连接采样末端位姿，不占用 servoj 那条 socket，
+            # 也不改变任何指令内容。
+            stop_ee, ee_samples = (None, None)
+            if args.log_press:
+                stop_ee, ee_samples = start_ee_watch(args.ws, args.accid,
+                                                     link=robot_link)
             stream_s, servo_stats = stream_trajectory(
                 ws_servo, args.accid, ref, SERVOJ_STREAM_HZ,
                 gripper=grip, sub_steps=sub_steps)
+            if stop_ee is not None:
+                stop_ee()
+            t_last_stream_end = time.perf_counter()
             time.sleep(0.2)
             after = read_robot_state(args.ws, args.accid)[0]
             print('     流 %.3f s (实测 %.0f Hz)；%s'
@@ -1570,26 +2085,47 @@ def main() -> int:
             print('     执行后 /joint_states(16): %s'
                   % np.array2string(after, precision=4))
             print('     实测相对计划末端 max|Δ|: %.4f rad'
-                  % float(np.abs(after - plan[-1]).max()))
+                  % float(np.abs(after - plan_exec[-1]).max()))
+            if ee_samples is not None:
+                rec = report_press_trace(ee_samples, task)
+                if rec is not None:
+                    rec['chunk'] = i
+                    press_records.append(rec)
+                    path = '%s_chunk%03d.npz' % (args.log_press, i)
+                    np.savez_compressed(path, t=rec['t'], right=rec['right'],
+                                        target=rec['target'],
+                                        offset=rec['offset'])
+                    print('     末端轨迹已存 %s' % path)
             print()
             if args.save_dir:
                 np.savez_compressed(
                     os.path.join(args.save_dir, 'chunk_%03d.npz' % i),
-                    plan=plan, qpos=qpos, states=states, actions=actions,
-                    **frames)
+                    plan=plan, plan_exec=plan_exec, exec_steps=exec_steps,
+                    qpos=qpos, states=states, actions=actions, **frames)
 
         if args.save_dir:
+            extra = {} if ee_r is None else {'ee_right': ee_r}
             path = os.path.join(args.save_dir, 'obs_%03d.npz' % i)
             np.savez_compressed(path, qpos=qpos, states=states,
-                                actions=actions, **frames)
+                                actions=actions, **frames, **extra)
             print('  已保存 %s' % path)
             print()
+
+        # 供下一段做"提前重规划"的时序集成
+        prev_plan = plan.copy()
+        prev_exec = exec_steps
+        print('  [时间账] 本轮总耗时 %.2f s' % (time.perf_counter() - t0))
 
         if i < args.runs:
             time.sleep(args.interval)
 
+    if press_records:
+        report_press_summary(press_records, task)
+
     if ws_servo is not None:
         ws_servo.close()
+    robot_link.close()
+    close_zmq(zmq_session)
     if args.execute:
         print('完成。执行模式已停止；机器人保持最后一条 servoj 指令的位置。')
     else:

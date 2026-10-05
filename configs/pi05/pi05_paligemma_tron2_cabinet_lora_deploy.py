@@ -188,6 +188,13 @@ themis = dict(
     ros_server=dict(
         dataset_section='inference',
         device='cuda:0',
+        # ⚠️ 必须打开，否则请求里的 seed 被完全忽略（ros_server.py:157/218）。
+        # forward_seed=False 时 fluxvla 每次推理都用全局 RNG 现取的噪声，
+        # 导致【同一个观测 + 同一个 seed 的两次调用可以差 0.086 rad】
+        # （约合按钮间距的 1/3）—— 实测 10 次连续调用右臂逐点标准差 0.0106 rad。
+        # 打开后：同 seed 可复现；客户端 --samples N 可用不同 seed 取平均，
+        # 按 1/sqrt(N) 削掉这部分抖动。
+        forward_seed=True,
     ),
 )
 
