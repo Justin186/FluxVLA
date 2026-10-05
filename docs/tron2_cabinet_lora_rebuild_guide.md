@@ -9,6 +9,11 @@
 > 两个系统级依赖**。凡标注「🆕 v2 实测」的都是复现时真跑出来的。
 >
 > **状态**：环境 ✅ 已复现 ｜ 单测 ✅ 41 passed ｜ 推理 ✅ 端到端跑通 ｜ 上机器人 ❌ 未做
+>
+> **🆕 v3 说明**：v3 在**火山引擎开发机的 Ubuntu 22.04 裸镜像**上从零搭了一遍，
+> 补上了 v1/v2 都缺的「**系统级前置**」一节（编译器 / conda 频道 / CUDA toolkit）。
+> 凡标注「🆕 v3」的都是这次真跑出来的，改动清单见**附录 E**。
+> 若你的机器是**已带 CUDA 环境和编译器的镜像**，可以跳过 §3.0。
 
 ---
 
@@ -43,6 +48,20 @@
 | 5 | ZMQ 服务起不来 / 一推理就崩 | `KeyError: config.themis is required`；`48 vs 135`；`got 32` | §6.2、§6.6 |
 | 6 | **冷启动第一条动作是错的** | 右臂最大偏差 0.41 rad（后续 0.03），**确定性复现** | §7.8 |
 | 7 | **不切换 `task_description`** | **不报错，但去做错的任务**（5 个任务共用一个模型） | §7.2、§9.6 |
+
+### 🆕 v3 动手前必读：裸机 / 云开发机多出来的 6 处
+
+v1 和 v2 用的都是**自带 CUDA toolkit 和编译器**的镜像，所以下面这些问题一次都没出现过。
+v3 在一台**火山引擎开发机（Ubuntu 22.04 裸镜像）**上从零搭，全部遇到了：
+
+| # | 问题 | 症状 | 修复位置 |
+|---|---|---|---|
+| 1 | 缺 gcc / build-essential | `Failed building wheel for netifaces`（**看起来像镜像坏了**，其实是缺编译器） | §3.0.1 |
+| 2 | conda 要求接受 Anaconda ToS | `CondaToSNonInteractiveError` | §3.0.2 |
+| 3 | 裸机没有 CUDA toolkit | `CUDA_HOME environment variable is not set` | §3.0.3 |
+| 4 | conda 的 CUDA 头放在 `targets/` 下 | `fatal error: cuda.h: No such file or directory` | §3.0.3 |
+| 5 | 默认 pip 索引只有 **186 KB/s** | **不报错，只是慢到数小时**（极易误判为"卡住"） | §3.4.5 |
+| 6 | 官方 flash-attn **两个** wheel 都用不了 | `undefined symbol: c10::Error::Error(...basic_string...)` | §3.4.2 |
 
 ---
 
@@ -158,6 +177,123 @@ assert os.path.exists(data_stat_path), \
 ---
 
 ## 3. 从零搭建
+
+### 3.0 🆕 v3 系统级前置（裸机 / 云开发机必做）
+
+**这一节是 v1/v2 完全没有的** —— 因为那两台机器都是已有 CUDA toolkit + 编译器的镜像。
+v3 在一台火山引擎开发机（Ubuntu 22.04 裸镜像）上从零搭，才暴露出来：这几步不做，
+后面 `pip install -e .` 必然失败，而且**报错位置离根因很远**。
+
+按 3.0.1 → 3.0.4 顺序做，全程约 15 分钟。
+
+#### 3.0.1 编译工具链（缺了会静默失败在依赖安装中途）
+
+```bash
+apt-get update
+apt-get install -y build-essential          # gcc / g++ / make / binutils
+```
+
+**为什么必须**：`netifaces` 等包没有 cp310 预编译 wheel，pip 会现场编译源码。
+缺 gcc 时的报错是：
+
+```
+building 'netifaces' extension
+gcc -pthread ... -c netifaces.c -o ...
+error: command 'gcc' failed: No such file or directory
+ERROR: Failed building wheel for netifaces
+pip install failed with all configured indexes.
+```
+
+⚠️ **迷惑之处**：它发生在 `install_env.sh` 装到一半，脚本会依次试所有 pip 镜像都失败，
+末尾那句 `failed with all configured indexes` 会让人以为是**网络或镜像坏了** ——
+实际是本机缺编译器，跟网络无关。
+
+#### 3.0.2 conda 频道（绕开 Anaconda ToS 拦截）
+
+新版 conda（26.x）对 `repo.anaconda.com` 的默认频道要求**接受服务条款**，
+非交互环境下直接中止：
+
+```
+CondaToSNonInteractiveError: Terms of Service have not been accepted for the following channels.
+    - https://repo.anaconda.com/pkgs/main
+    - https://repo.anaconda.com/pkgs/r
+```
+
+⚠️ `conda config --remove channels defaults` **无效** —— `defaults` 不在配置里，
+它是 `default_channels` 的隐式展开，所以会报 `value 'defaults' not present in config`。
+真正生效的是把 `default_channels` 清空：
+
+```bash
+cat > ~/.condarc <<'EOF'
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+default_channels: []
+show_channel_urls: true
+EOF
+```
+
+> 一步同时解决两件事：不再触发 ToS 检查，且国内走清华镜像明显更快。
+> 验证：`conda install -y -p $CONDA_PREFIX cmake ninja` 应能直接跑完。
+
+#### 3.0.3 CUDA toolkit（**v1/v2 漏掉的关键前置**）
+
+`pip install -e .` 要编译 `fluxvla/ops/cuda/` 下的 3 个 CUDA 扩展
+（`gemma_rotary_embedding_ext` / `rotary_pos_embedding_ext` / `matmul_bias_ext`），
+**需要 nvcc + CUDA 头 + CUDA 库**。文档里 `export CUDA_HOME=/usr/local/cuda`
+（见 `pi05_tron2_cabinet_lora_training_config.md`）是**预设它已存在**的，裸机没有：
+
+```
+OSError: CUDA_HOME environment variable is not set. Please set it to your CUDA install root.
+```
+
+装（12.4 对应 torch 的 cu124）：
+
+```bash
+conda install -y -p $CONDA_PREFIX \
+  -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge \
+  --override-channels cuda-toolkit=12.4
+```
+
+然后 **两条软链 + 一次头文件合并**，让 conda 的布局符合 torch 的预期：
+
+```bash
+P=$CONDA_PREFIX
+ln -sfn "$P" /usr/local/cuda                              # 让 CUDA_HOME=/usr/local/cuda 成立
+ln -sfn lib "$P/lib64"                                    # conda 用 lib/，torch 找 lib64/
+cp -rn "$P/targets/x86_64-linux/include/." "$P/include/"  # ← 见下，最容易漏
+```
+
+⚠️ **第三条最容易漏**：conda-forge 的 CUDA 包把一部分头文件放在
+`$PREFIX/targets/x86_64-linux/include/`（如 `cuda.h`、`cudaTypedefs.h`、`nvrtc.h`），
+而 torch 的 `cpp_extension` 只传 `-I$CUDA_HOME/include`。后果是：
+
+```
+fluxvla/ops/cuda/gemma_rotary_embedding/src/gemma_rotary_embedding_forward.cpp:15:10:
+  fatal error: cuda.h: No such file or directory
+```
+
+迷惑之处：`cub` / `thrust` **恰好**在 `$PREFIX/include/` 下，所以只有部分头找不到，
+看起来像"装少了包"，其实是路径布局问题。`cp -rn` 的 `-n` 表示不覆盖已有文件，
+可以安全重复执行。
+
+#### 3.0.4 一步到位的依赖安装命令
+
+把上面的选择合起来（火山内网机器）：
+
+```bash
+cd ~/tron_ws/FluxVLA
+conda activate fluxvla
+PIP_INDEX_URLS=https://mirrors.ivolces.com/pypi/simple/ \
+TORCH_INDEX_URLS=https://mirrors.ivolces.com/pypi/simple/ \
+GH_PROXY=https://ghfast.top \
+bash scripts/install_env.sh real-only --profile cu124
+```
+
+`PIP_INDEX_URLS` / `TORCH_INDEX_URLS` 的存在原因见 §3.4.5；`GH_PROXY` 见 §3.4.1/§3.4.2。
+
+> 🆕 v3 实测：这套命令在裸机上从 0 装到 `install_env.sh` 走完约 **10 分钟**
+> （环境体积 7.8 GB），其中 torch 那一坨占了 5.8 GB。
+> **脚本仍会在 flash-attn 处中止** —— 那是预期行为，接着做 §3.4.4 即可。
 
 ### 3.1 装 conda 与环境
 
@@ -397,6 +533,44 @@ pip install --no-deps --force-reinstall \
 > ⚠️ 下载后**不要改文件名**。改名成 `fa.whl` 之类会导致
 > `ERROR: Invalid wheel filename (wrong number of parts)`。
 
+##### 🆕 v3 补充：根因是 C++ ABI，不只是 glibc（可提前一行预判）
+
+上一节把原因归给 glibc，那只解释了 v2 那台 **Ubuntu 20.04（glibc 2.31）** 的情况。
+v3 在 **glibc 2.35 的 Ubuntu 22.04** 上**仍然失败**，用 `nm` 一比才看清真正原因：
+
+```
+官方 wheel 需要      : _ZN3c105ErrorC2ENS_14SourceLocationENSt7__cxx1112basic_stringI...
+torch 的 libc10 提供 : _ZN3c105ErrorC2ENS_14SourceLocationESs
+```
+
+- `...ENSt7__cxx1112basic_stringI...` = **新 ABI**（cxx11）
+- `...ESs` = **旧 ABI**
+
+**官方 release 的 `cxx11abiFALSE` 和 `cxx11abiTRUE` 两个文件，内部都是新 ABI 编的**；
+而 torch 2.6.0 **不论从 PyPI 还是 pytorch.org 装**都是旧 ABI（已逐一验证），
+所以官方那两个 wheel **一个都对不上**。社区那份（文件名里不含 `cxx11abi` 字样的）
+才是旧 ABI 构建。
+
+**装之前用两行预判，省一次盲试**：
+
+```bash
+F=/tmp/flash_attn-2.8.3+cu124torch2.6-cp310-cp310-linux_x86_64.whl
+python -c "import zipfile; zipfile.ZipFile('$F').extractall('/tmp/fa/')"
+nm -D --undefined-only /tmp/fa/flash_attn_2_cuda*.so | grep -oE '_ZN3c105ErrorC2[^ ]*'
+nm -D --defined-only $CONDA_PREFIX/lib/python3.10/site-packages/torch/lib/libc10.so \
+  | grep -oE '_ZN3c105ErrorC2[^ ]*'
+```
+
+两行输出**完全一致**才装。顺带可以看 glibc 需求（v3 实测社区那份只有 2.2.5 / 2.14）：
+
+```bash
+objdump -T /tmp/fa/flash_attn_2_cuda*.so | grep -oE 'GLIBC_[0-9.]+' | sort -uV
+```
+
+> 📌 v3 实测结论：**用社区预编译 wheel 比按 `pi05_tron2_cabinet_lora_training_config.md`
+> 从源码编译快得多**（110 MB 直接装完 vs 需要 nvcc + 数分钟编译）。
+> 两条路都可行，网络受限时优先走预编译 wheel。
+
 **验证（必须真跑一次 GPU 计算，不能只看 import）**：
 
 ```bash
@@ -478,6 +652,61 @@ cd ~/tron_ws/FluxVLA
 pip install --no-build-isolation -e .
 python -c "import fluxvla; print('FluxVLA installed:', fluxvla.__file__)"
 ```
+
+> ⚠️ **🆕 v3**：这一步会编译 `fluxvla/ops/cuda/` 下 **3 个 CUDA 扩展**。
+> 裸机**必须先做完 §3.0.3**（CUDA toolkit + 两条软链 + 头文件合并），
+> 否则报 `CUDA_HOME environment variable is not set` 或 `cuda.h: No such file or directory`。
+
+建议显式带上 `CUDA_HOME` 和 `MAX_JOBS`（v3 实测 torch 自动只编 sm_89，约 2 分钟）：
+
+```bash
+cd ~/tron_ws/FluxVLA
+CUDA_HOME=/usr/local/cuda MAX_JOBS=16 pip install --no-build-isolation -e .
+python -c "import fluxvla; print('FluxVLA installed:', fluxvla.__file__)"
+python -c "import fluxvla.ops; print('fluxvla.ops OK')"      # 3 个 CUDA 扩展能否加载
+find fluxvla/ops -name "*_ext*.so"                           # 应恰好 3 个
+```
+
+#### 3.4.5 🆕 v3 [国内网络] pip 索引选择（默认会慢 1600 倍）
+
+`install_env.sh` 对 torch 固定使用 PyTorch 官方索引：
+
+```
+pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0 ...
+```
+
+国内实测这条链路只有 **186 KB/s**。要下的东西（cudnn 665 MB + torch 766 MB +
+triton/nccl/cublas 等）合计约 2.5 GB，**按这个速度要数小时**。
+
+⚠️ **它不报错，只是慢** —— 极易被误判为"卡住了"。判断它到底有没有在下载：
+
+```bash
+P=$(pgrep -f "pip install" | head -1)
+a=$(awk '/^rchar/{print $2}' /proc/$P/io); sleep 30
+b=$(awk '/^rchar/{print $2}' /proc/$P/io)
+echo "$(( (b-a)/30/1024 )) KB/s"        # 186 就是慢，0 才是真卡住
+```
+
+> 📌 不要用"日志是否增长"或"pip 缓存是否变大"判断 —— pip 输出重定向到文件后是
+> **块缓冲**的（日志会滞后几 KB），而下载临时文件在 `/tmp/pip-unpack-*`，不进缓存。
+> **只有 `/proc/<pid>/io` 的 `rchar` 是准的。**
+
+**解法**：把 torch 也指向内网 / 国内镜像。已确认该镜像同时有 `torch 2.6.0`
+和 `nvidia-cudnn-cu12 9.1.0.70`：
+
+```bash
+PIP_INDEX_URLS=https://mirrors.ivolces.com/pypi/simple/ \
+TORCH_INDEX_URLS=https://mirrors.ivolces.com/pypi/simple/ \
+bash scripts/install_env.sh real-only --profile cu124
+```
+
+| | 速率 | 下完那 2.5 GB |
+|---|---|---|
+| 默认（`download.pytorch.org`） | 186 KB/s | ~4 小时 |
+| 内网 PyPI 镜像 | **307 MB/s** | **~10 秒** |
+
+切换不会重复下载：pip 会跳过已装好的包。**改用镜像后记得先 `kill` 掉旧进程**，
+否则两个 pip 会同时写同一个环境。
 
 ### 3.5 验证 torch 真能用 GPU
 
@@ -1108,6 +1337,12 @@ v1 说"1~6 帧（33~200 ms）"，🆕 **v2 实测比这个更严重**：数据�
 | 夹爪读数像 0.02 或 2 | 忘了 `/100`（hw 0-100 ↔ 数据集 0-1） | 见 §9.5 |
 | 拧旋钮任务夹爪不动 | 夹爪指令没下发 | 需要 `--send-gripper`（§7.2） |
 | **续训后第一步 loss 跳回 0.3~0.4** | LoRA 检查点存的是合并权重，旧 resume 逻辑把它静默丢弃了 | 已修复（2026-10-03）。详见 `docs/pi05_tron2_cabinet_lora_training_config.md` 第 13 章「检查点、续训与训练监控」 |
+| `Failed building wheel for netifaces`，`gcc: No such file or directory` | **裸机缺编译器**（不是镜像坏了） | `apt-get install -y build-essential`（§3.0.1） |
+| `CondaToSNonInteractiveError: Terms of Service have not been accepted` | 新版 conda 要求接受 Anaconda ToS | 清空 `default_channels`（§3.0.2）；`--remove channels defaults` 无效 |
+| `CUDA_HOME environment variable is not set`（`pip install -e .`） | **裸机没有 CUDA toolkit** | 装 `cuda-toolkit=12.4` + 两条软链（§3.0.3） |
+| `fatal error: cuda.h: No such file or directory`（编扩展） | conda 把 CUDA 头放在 `targets/x86_64-linux/include/` | `cp -rn` 合并进 `$PREFIX/include/`（§3.0.3） |
+| pip 下载只有 ~186 KB/s 且日志不增长 | torch 走 `download.pytorch.org` 公网（**不报错，只是慢**） | 换内网索引；用 `/proc/<pid>/io` 的 `rchar` 判断进度（§3.4.5） |
+| `undefined symbol: c10::Error::Error(... std::__cxx11::basic_string ...)`（flash-attn） | **官方 `cxx11abiFALSE`/`TRUE` 两个 wheel 内部都是新 ABI，而 torch 2.6.0 是旧 ABI** | 换社区预编译 wheel（§3.4.2），装前 `nm` 对比符号预判 |
 
 ### 有用的监控命令
 
@@ -1441,3 +1676,45 @@ finite = True，机器人全程静止
 | §6.5 | 任务文本当作常量 | ❌ 5 个任务共用一个模型，**`task_description` 是唯一路由手段**，发错不报错但做错事（§9.6） |
 | §9.4 | （未写相机通道顺序） | 新增：compressed 话题是 **bgr8 JPEG**，`cv2` 解出 BGR 而训练用 RGB，客户端**必须 `[..., ::-1]`** |
 | §9.5 | （未写指令接口） | 新增：`movej` 14 维 / `servoj` 16 维 / `limx_2fclaw` 夹爪，含正增益与 500 Hz 插值要求；并指出**官方文档的 servoj 报文与仓库实现不一致** |
+
+---
+
+## 附录 E：🆕 v3 相对 v2 的修订清单
+
+**v3 的背景**：v1 是"从已有产物的机器搬到另一台已有 CUDA 环境的机器"，v2 是"同一件事换到 Ubuntu 20.04"。
+v3 第一次在**火山引擎开发机的 Ubuntu 22.04 裸镜像**上从零搭（GPU 为 RTX 4090 D ×1）。
+踩到的问题全部属于"**镜像里根本没有的东西**"，与 v2 的"**20 与 22 的版本差异**"是互补的两类。
+
+| 位置 | v2 说法 | v3 修订 |
+|---|---|---|
+| §3（整节） | 未提系统级前置 | **新增 §3.0**：编译工具链 / conda 频道 / CUDA toolkit 三件事 |
+| §3.0.1 | （未提） | 缺 gcc 会让 `install_env.sh` 装依赖中途失败，且报错看起来像"镜像坏了" |
+| §3.0.2 | （未提） | 新版 conda 要接受 Anaconda ToS；`--remove channels defaults` 无效，必须清 `default_channels` |
+| §3.0.3 | `export CUDA_HOME=/usr/local/cuda`（当作已存在） | **裸机没有**：装 conda `cuda-toolkit=12.4`，再补 2 条软链 + 头文件合并 |
+| §3.4.2 | 把 flash-attn 失败归因给 glibc 2.32 | 补充**真正根因是 C++ ABI**：官方两个 wheel 内部都是新 ABI，而 torch 2.6.0 是旧 ABI；给出 `nm` 预判法 |
+| §3.4.2 | 从源码编译 flash-attn | 补充：**社区预编译 wheel 更快**（110 MB 直接装完 vs 需要 nvcc + 数分钟编译），两条路都可行 |
+| §3.4.4 | 手动 `pip install -e .` | 补充：该步要编 3 个 CUDA 扩展，**裸机必须先做 §3.0.3** |
+| §3.4.5 | （未提） | **新增**：默认 pip 索引国内只有 186 KB/s（不报错、只是慢）；换内网镜像 307 MB/s |
+| §8 等 | 用日志/缓存判断下载进度 | 补充：pip 输出重定向后是块缓冲、下载件在 `/tmp` 不进缓存，**只有 `/proc/<pid>/io` 的 `rchar` 是准的** |
+| §8 | 19 行速查表 | 补 6 行（gcc / ToS / CUDA_HOME / cuda.h / pip 慢 / flash-attn ABI） |
+| 附录 | — | 新增本表 |
+
+**v3 实测的环境基线**（与 §4 对照，除下列项外一致）：
+
+| 项 | v3 实测 |
+|---|---|
+| 系统 | Ubuntu 22.04 (jammy) · glibc 2.35 · 内核 5.4.250-velinux1u1 |
+| GPU / 驱动 | RTX 4090 D 24 GB · 驱动 535.154.05（自报 CUDA 12.2） |
+| CUDA toolkit | conda-forge `cuda-toolkit=12.4`（nvcc 12.4.131） |
+| torch | 2.6.0+cu124 · **`_GLIBCXX_USE_CXX11_ABI = False`** |
+| flash-attn | 2.8.3（社区 `mjun0812` wheel，文件名不含 `cxx11abi`） |
+| 环境体积 | **7.8 GB** |
+| 端到端校验 | `import fluxvla.ops` ✅ ｜ `pytest test/test_transforms test/test_datasets` → **41 passed** ✅ |
+| 安装耗时 | 裸机 → `install_env.sh` 走完约 **10 分钟**（走内网镜像） |
+
+> 📌 **v3 最重要的一条经验**：这台机器上的报错有**两次是指向错误方向**的 ——
+> `Failed building wheel for netifaces` 看起来像镜像坏了（其实缺 gcc），
+> flash-attn 的 `undefined symbol` 看起来像 glibc（其实是 C++ ABI）。
+> **两者都是"缺一样本机没有的东西"，而不是网络或包本身的问题。**
+> 下次遇到 `install_env.sh` 中途失败，先检查本机缺什么（gcc / CUDA toolkit / 头文件），
+> 再看网络。
