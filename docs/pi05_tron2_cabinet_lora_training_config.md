@@ -1001,7 +1001,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 注意事项：
 
 - **必须用 `.pt`**（含优化器/调度器状态），不是 `.safetensors`。
-- `pod_scripts/train_tron2_buttons.sh` **不支持 `--resume-from`**，续训要直接跑 `torchrun`。该脚本会就地 patch config，所以 config 已是可用状态，直接跑即可。
+- `scripts/train_tron2_buttons.sh` **不支持 `--resume-from`**，续训要直接跑 `torchrun`。该脚本会就地 patch config，所以 config 已是可用状态，直接跑即可。
 - 续训会生成**新的** `<时间戳>.jsonl` / `.csv`（`run_id` 含启动时间戳），**不会追加**到旧文件。看完整曲线需要把两段接起来。
 - `run-metrics.jsonl` 会被新进程覆盖重写（不含曲线，无影响）。
 - `global_step` 从检查点继续，通常无需改 `max_steps`。

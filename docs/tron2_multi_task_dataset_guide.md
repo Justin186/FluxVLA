@@ -833,7 +833,7 @@ class AttachRABCWeight:
 
 右臂逐维误差上升 40~85%（`0.0069→0.0099`、`0.0128→0.0215` …），而**左臂几乎不变** —— 这个对照直接说明 prompt 影响的是「要执行什么动作」，不是噪声。
 
-复现命令：`python pod_scripts/eval_tron2_per_task.py --prompt-override 'complete the task'`
+复现命令：`python scripts/eval_tron2_per_task.py --prompt-override 'complete the task'`
 （结果存档：`eval_step10000.json` / `eval_step10000_wrongprompt.json`）
 
 **修法**（措辞与数据集里一字不差）：

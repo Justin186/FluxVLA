@@ -106,10 +106,14 @@ pkill -f zmq_inference_server
 用数据集里的真实观测（3 路 mp4 帧 + parquet 状态）走完整链路，验证服务、反归一化、
 prompt 路由是否正常。**换权重/改配置后先跑这个。**
 
+> ℹ️ TRON2 相关脚本都在 **`FluxVLA/scripts/`** 下（2026-10-05 从 workspace 根目录的
+> `pod_scripts/` 合并进来，与 `train.py` / `tron2_robot_client.py` 同一层），
+> 所以命令一律先 `cd /home/lab/tron_ws/FluxVLA`。
+
 ```bash
-cd /home/lab/tron_ws && unset PYTHONPATH
+cd /home/lab/tron_ws/FluxVLA && unset PYTHONPATH
 /home/lab/miniconda3/envs/fluxvla/bin/python \
-  pod_scripts/test_tron2_inference_offline.py --frame 60 --repeat 3
+  scripts/test_tron2_inference_offline.py --frame 60 --repeat 3
 ```
 
 预期：
@@ -444,4 +448,4 @@ sshpass -p 123456 ssh guest@10.192.1.4 'pkill -f camera_shim.py'   # 停相机 s
   续训必须用 `.pt`（含优化器/调度器状态），**不是** `.safetensors`。
 - 续训正确性判据：启动后第一个 `Global Step` 的 loss 应接在中断处
   （step 10000 时约 **0.0036**）。若跳到 **0.39**，说明 LoRA 权重被静默丢弃了（历史 bug）。
-- `pod_scripts/train_tron2_buttons.sh` **不支持 `--resume-from`**，续训要直接跑 `torchrun`。
+- `scripts/train_tron2_buttons.sh` **不支持 `--resume-from`**，续训要直接跑 `torchrun`。
